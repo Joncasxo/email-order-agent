@@ -1,0 +1,5 @@
+anthropic>=0.60
+pywin32>=308
+openpyxl>=3.1
+xlrd>=2.0
+Pillow>=10.0

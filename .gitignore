@@ -1,0 +1,30 @@
+# Nustatymai su užšifruotais raktais ir prisijungimo žetonai
+config.json
+graph_token.bin
+
+# Vietiniai duomenys ir žurnalai
+uzsakymai.db
+*.db
+*.db-journal
+zurnalas.txt
+*.log
+
+# Eksportuoti / darbiniai failai
+*.vcf
+*.xlsx
+*.xls
+*.ods
+tiekejai.xlsx
+atsargines_kopijos/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Sukompiliuotos programos
+*.exe
+build/
+dist/
