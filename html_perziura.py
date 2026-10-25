@@ -8,6 +8,7 @@ import datetime
 import json
 import re
 
+import prekes as prekes_mod
 import storage
 
 _TERM_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[ T]+(\d{1,2})[:.](\d{2}))?")
@@ -66,8 +67,11 @@ def _duomenys():
             "statusas": o.get("statusas") or "",
             "saskaita": int(o.get("saskaita") or 0),
             "priedai": len([s for s in (o.get("priedai") or "").split(";") if s.strip()]),
-            "prekes": [{"preke": p.get("preke") or "", "kiekis": p.get("kiekis") or "",
-                        "pastabos": p.get("pastabos") or ""} for p in prekes],
+            "imone": o.get("kliento_imone") or "",
+            "prekes": [{"preke": prekes_mod.pilnas_pavadinimas(p),
+                        "kiekis": prekes_mod.kiekis_tekstu(p),
+                        "pastabos": " ".join(x for x in (p.get("pastabos"), p.get("nuoroda"))
+                                             if x)} for p in prekes],
             "pastabos": o.get("pastabos") or "",
             "mano_pastabos": o.get("mano_pastabos") or "",
             "santrauka": o.get("santrauka") or "",
@@ -246,6 +250,7 @@ function atidaryk(tr, o) {
   }
   const laukai = [];
   if (o.tema) laukai.push("<b>Laiško tema:</b> " + esc(o.tema));
+  if (o.imone) laukai.push("<b>Įmonė:</b> " + esc(o.imone));
   if (o.sutartis) laukai.push("<b>Sutartis:</b> " + esc(o.sutartis));
   if (o.pristatymo_data) laukai.push("<b>Pristatymas:</b> " + esc(o.pristatymo_data));
   if (o.el_pastas) laukai.push("<b>El. paštas:</b> " + esc(o.el_pastas));

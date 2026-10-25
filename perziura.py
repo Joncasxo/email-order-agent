@@ -24,6 +24,21 @@ DB_NAME = "uzsakymai.db"
 REFRESH_MS = 3000
 
 
+
+def _kiekis_tekstu(it):
+    """„10 vnt." — kiekis su vienetu (seni įrašai — kaip buvo)."""
+    k = str(it.get("kiekis") or "").strip()
+    v = (it.get("vienetas") or "").strip()
+    return f"{k} {v}".strip() if k else (v or "nenurodyta")
+
+
+def _pavadinimas(it):
+    p = (it.get("preke") or "").strip()
+    kodas = (it.get("kodas") or "").strip()
+    if kodas and kodas.lower() not in p.lower():
+        p = f"{p} (kodas: {kodas})" if p else f"kodas: {kodas}"
+    return p
+
 def _log(msg):
     try:
         with open(os.path.join(APP_DIR, "perziura_log.txt"), "a", encoding="utf-8") as f:
@@ -254,7 +269,7 @@ class Viewer:
                 items = json.loads(o.get("prekes_json") or "[]")
             except Exception:
                 items = []
-            prekes = "; ".join(f"{it.get('preke')} ({it.get('kiekis')})" for it in items[:4])
+            prekes = "; ".join(f"{_pavadinimas(it)} ({_kiekis_tekstu(it)})" for it in items[:4])
             if len(items) > 4:
                 prekes += f" … (+{len(items) - 4})"
             n_atts = len([s for s in (o.get("priedai") or "").split(";") if s.strip()])
@@ -312,6 +327,7 @@ class Viewer:
                 lines = [
                     f"Kodas:  {o.get('kodas') or '—'}",
                     f"Klientas:  {o.get('klientas') or '—'}",
+                    f"Įmonė:  {o.get('kliento_imone') or '—'}",
                     f"Telefonas:  {o.get('kliento_telefonas') or '—'}",
                     f"Adresas:  {o.get('kliento_adresas') or '—'}",
                     f"El. paštas:  {o.get('kliento_el_pastas') or '—'}",
@@ -326,9 +342,11 @@ class Viewer:
                     "PREKĖS:",
                 ]
                 for i, it in enumerate(items, 1):
-                    line = f"  {i}. {it.get('preke')} — {it.get('kiekis')}"
+                    line = f"  {i}. {_pavadinimas(it)} — {_kiekis_tekstu(it)}"
                     if it.get("pastabos"):
                         line += f"   [{it['pastabos']}]"
+                    if it.get("nuoroda"):
+                        line += f"   {it['nuoroda']}"
                     lines.append(line)
                 if o.get("atnaujinimai"):
                     lines += ["", "🔔 ATNAUJINIMAI (grandinės papildymai):"]

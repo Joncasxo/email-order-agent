@@ -4,6 +4,7 @@ import json
 
 import anthropic
 
+import prekes as prekes_mod
 from attachments import build_attachment_content
 
 SYSTEM_PROMPT = """Tu esi įmonės pagalbininkas, analizuojantis įmonės gautus el. laiškus ir atpažįstantis klientų užsakymus.
@@ -27,26 +28,35 @@ Susirašinėjimo grandinės (LABAI SVARBU, kad nebūtų dublikatų):
 - Kliento „Kvietimas pateikti kainų pasiūlymą" pagal sutartį (net jei adresuotas keliems tiekėjams vienu metu) YRA užsakymas-užklausa: ar_uzsakymas=true, klientas — kvietimą pasirašęs kliento darbuotojas, „pasiulymo_terminas" — laiške nurodytas pateikimo terminas, „sutartis" — kvietime minimas sutarties numeris, o prekės — iš kvietimo teksto ir pridėtos pasiūlymo formos.
 
 TIKSLUMO REIKALAVIMAI (labai svarbu — nuo to priklauso, ar užsakymą galima įvykdyti):
-- Prekės pavadinimą perrašyk PAŽODŽIUI taip, kaip parašyta laiške ar priede: nekeisk skyrybos, didžiųjų raidžių, matmenų formato ar dešimtainių skirtukų („18 V; 5,0 Ah" lieka „18 V; 5,0 Ah", „W21.8" lieka „W21.8", NE „W21,8").
-- Jei prie prekės yra NUORODA (http/https) į tiekėjo puslapį — ji BŪTINAI turi likti prekės pavadinime arba pastabose. Nuorodų niekada nepraleisk ir netrumpink.
-- Prekės kodas / artikulas („prekės kodas: 149622", „kodas 2000092", gamintojo numeris) yra PRIVALOMAS, jei tik laiške ar priede minimas — įrašyk jį į „preke" tokiu pat formatu („prekės kodas: 149622"). Modelis, gamintojas, spalva (RAL), matmenys, standartas — taip pat.
-- Lauke „preke" rašyk TIK prekės identifikaciją (pavadinimas, modelis, kodas, specifikacijos, nuoroda). Visos sąlygos, reikalavimai, vieta, aplinkybės ir prierašai („reikalingas su dviem akumuliatoriais", „darbas šlaite po tiltu", „tartis su UAB X", kelio numeris ir kilometras) eina į tos prekės „pastabos" — NEKIŠK jų į pavadinimą.
-- Kiekvienos prekės „pastabos" pildyk, jei laiške apie tą prekę yra bet kokių papildomų sąlygų ar konteksto. Palik null tik tada, kai tikrai nieko nėra.
-- „pristatymo_data": perrašyk VISĄ nurodytą laiką pažodžiui, su visomis datomis, intervalais ir valandomis (pvz., „2026-08-13 / 2026-08-14, betonas bent jau 8 val."). Nesutrumpink iki vienos datos.
-- Kiekį rašyk taip, kaip nurodyta laiške, KARTU su matavimo vienetu ir papildoma sąlyga: jei parašyta „5 vnt. po 4 m" — rašyk „5 vnt. po 4 m", o ne „5 vnt.". Ilgio/kiekio informacijos neperkelk į prekės pavadinimą, jei laiške ji nurodyta prie kiekio.
-- Nieko neapibendrink ir nesutrumpink: geriau ilgesnis tikslus pavadinimas nei „gražesnis" trumpesnis.
+- Prekės pavadinimą perrašyk PAŽODŽIUI taip, kaip parašyta laiške ar priede: nekeisk skyrybos, didžiųjų raidžių, matmenų formato ar dešimtainių skirtukų („18 V; 5,0 Ah" lieka „18 V; 5,0 Ah", „W21.8" lieka „W21.8", NE „W21,8"). Nieko neapibendrink ir nesutrumpink.
+- Nieko neišmesk: jei informacija netelpa į tam skirtą lauką, ji eina į „pastabos", bet NIEKADA nedingsta.
+
+TVARKA (duomenys turi būti švarūs ir lengvai skaitomi — laiškai būna netvarkingi, tavo atsakymas — ne):
+- Viena eilutė „prekes" sąraše = viena skirtinga prekė. Skirtingi variantai (spalva, dydis, modelis) — atskiros eilutės. Ta pati prekė, paminėta ir laiško tekste, ir priede, — VIENA eilutė (jei kiekiai skiriasi, imk naujesnį / tikslesnį ir skirtumą parašyk „ispejimas").
+- Prekių eilės tvarka — tokia, kokia laiške / priede.
+- Lentelių antraštės, tarpinės ir galutinės sumos, kainų ar PVM eilutės, pasisveikinimai ir parašai NĖRA prekės.
+- Lauke „preke" — TIK prekės pavadinimas su specifikacijomis (gamintojas, modelis, matmenys, spalva, standartas). Be kiekio, be kodo, be nuorodos, be sąlygų.
+- „kodas" — prekės kodas / artikulas / gamintojo numeris, jei minimas (tik pats kodas, pvz. „149622", be žodžio „kodas"). Jei kodų keli — atskirk „; ". Nėra — null.
+- „nuoroda" — pilna http/https nuoroda į prekės puslapį, jei pateikta (netrumpink). Nėra — null.
+- „kiekis" — TIK skaičius (pvz. 10 arba 5.5). Jei kiekis nenurodytas ar neaiškus — null (ir parašyk „ispejimas").
+- „vienetas" — mato vienetas trumpai: „vnt.", „kompl.", „pak.", „dėž.", „m", „m²", „m³", „kg", „l", „t", „rul.", „pad.", „por." ar kitas, kaip laiške. Nenurodytas — null.
+- Visa, kas apie kiekį yra papildomai („po 4 m", „po 24 vnt. dėžėje", „apie", „su atsarga"), ir visos sąlygos, reikalavimai, vieta, aplinkybės, prierašai apie tą prekę eina į tos prekės „pastabos" — trumpais aiškiais sakiniais. Nėra — null.
+- Kontaktų laukuose — tik pati reikšmė, be žodžių „tel.", „el. paštas", „adresas:" ir be parašo šiukšlių.
 
 Laukai:
 - „klientas" — užsakančio ASMENS vardas ir pavardė (pvz., „Vardenis Pavardenis"), ne įmonės pavadinimas.
+- „kliento_imone" — įmonė ar organizacija, kuriai atstovauja klientas (iš parašo, domeno ar teksto), jei aišku. Nėra — null.
+- „kliento_el_pastas" — kliento el. pašto adresas.
 - „kliento_adresas" — pristatymo arba kliento adresas iš laiško teksto ar parašo (pvz., „Liepų g. 15, 01234 Vilnius").
 - „kliento_telefonas" — telefono numeris iš laiško ar parašo.
 - „uzsakymo_data" — kada užsakymas PARAŠYTAS PIRMĄ KARTĄ, formatu YYYY-MM-DD arba YYYY-MM-DD HH:MM. LABAI SVARBU: jei analizuojamas laiškas yra atsakymas (Re:) ar persiuntimas (FW:), imk PRADINIO užsakymo laiško datą iš cituojamų antraščių (Sent:/Date:/Išsiųsta:/Data:), o NE naujausio laiško datą. Jei pradinės datos nesimato — palik null. ATSKIRK: pradinio ŠIO užsakymo laiško data ≠ ankstesnio pirkimo data. Jei klientas NAUJAME laiške prašo „pakartoti kaip anksčiau / tokių pačių kaip pirkome" — tai NAUJAS užsakymas, jo data yra to prašymo laiško data, o ne cituojamo seno susirašinėjimo apie ankstesnį pirkimą.
-- „pasiulymo_terminas" — iki kada prašoma pateikti pasiūlymą / atsakymą, jei nurodyta (pvz., „2026-07-21 10:00").
-- „sutartis" — sutarties numeris, jei laiške ar prieduose minimas (pvz., „SUT24-61", „KIT26-403"). Rašyk tiksliai taip, kaip parašyta, be tarpo klaidų.
-- Kiekius rašyk taip, kaip nurodyta (pvz., „10 vnt.", „2 dėž.", „5,5 kg"). Jei kiekis nenurodytas, rašyk „nenurodyta".
+- „pasiulymo_terminas" — iki kada prašoma pateikti pasiūlymą / atsakymą, TIK formatu YYYY-MM-DD HH:MM (arba YYYY-MM-DD, jei valanda nenurodyta). Papildomas tekstas apie terminą — į bendras „pastabos".
+- „pristatymo_data" — perrašyk VISĄ nurodytą laiką su visomis datomis, intervalais ir valandomis (pvz., „2026-08-13 / 2026-08-14, ne anksčiau 8 val."). Datas rašyk YYYY-MM-DD formatu. Nesutrumpink iki vienos datos.
+- „sutartis" — sutarties numeris, jei laiške ar prieduose minimas (pvz., „SUT24-61"). Rašyk tiksliai, be tarpo klaidų.
+- „pastabos" — bendra informacija apie VISĄ užsakymą, kuri netinka kitiems laukams (ne apie konkrečią prekę). Nėra — null.
 - „pasitikejimas" — tavo įsitikinimas 0..1, kad klasifikacija teisinga.
 - „santrauka" — 1–2 sakiniai, kas šiame laiške yra.
-- „ispejimas" — APSAUGA NUO VYKDYMO KLAIDŲ. Užpildyk TIK tada, kai laiškas nėra paprastas „užsakykite prekes" atvejis ir vykdytojas, neįsiskaitęs konteksto, gali padaryti brangią klaidą. Įspėjimą pradėk nuo to, KO NEDARYTI, tada trumpai kodėl. Tipiniai atvejai: (1) prašoma TIK pakoreguoti / įregistruoti / perregistruoti JAU ĮVYKDYTĄ užsakymą kliento pirkimų sistemoje — rašyk pvz. „NEUŽSAKINĖTI PREKIŲ IŠ NAUJO — jos jau pristatytos, prašoma tik pakoreguoti ir įregistruoti užsakymą per kliento pirkimų sistemą“; (2) sąskaita jau išrašyta, prašoma tik dokumentų pataisymo; (3) laiškas galimai dubliuoja ankstesnį užsakymą iš sąrašo; (4) prašymas dviprasmiškas ar prieštaringas (neaišku, užsakyti ar tik teirautis kainos); (5) KIEKIO PROBLEMA — flaguok VISUS kiekio netikslumus, ne tik dviprasmybes: kiekis IŠVIS NENURODYTAS (rašai „nenurodyta"); dviprasmiškas — pvz., „2 dėž 24 vnt." (neaišku, ar 2 dėžės PO 24 vnt. = 48, ar 2 dėžės, kuriose iš viso 24 vnt.); „3 pak", kai nežinomas pakuotės dydis; kiekis be mato vieneto, kai prekė matuojama keliais būdais (metrai ar vienetai); laiške ir priede nurodyti SKIRTINGI kiekiai; kiekis nurodytas tik daliai prekių; kiekis su sąlyga („apie", „maždaug", „~", „priklausys nuo"); bet koks kitas neapibrėžtumas, dėl kurio užsakant galima suklysti. Kiekio įspėjime įvardink KONKREČIAS prekes ir kas neaišku, pvz.: „PASITIKSLINTI KIEKĮ prieš užsakant: „2 dėž 24 vnt." gali reikšti 48 vnt. (2×24) arba 24 vnt.; prekei X kiekis išvis nenurodytas". Įprastoms pastaboms šio lauko NENAUDOK — jei viskas aišku, palik null.
+- „ispejimas" — APSAUGA NUO VYKDYMO KLAIDŲ. Užpildyk TIK tada, kai laiškas nėra paprastas „užsakykite prekes" atvejis ir vykdytojas, neįsiskaitęs konteksto, gali padaryti brangią klaidą. Įspėjimą pradėk nuo to, KO NEDARYTI, tada trumpai kodėl. Tipiniai atvejai: (1) prašoma TIK pakoreguoti / įregistruoti / perregistruoti JAU ĮVYKDYTĄ užsakymą kliento pirkimų sistemoje — rašyk pvz. „NEUŽSAKINĖTI PREKIŲ IŠ NAUJO — jos jau pristatytos, prašoma tik pakoreguoti ir įregistruoti užsakymą per kliento pirkimų sistemą“; (2) sąskaita jau išrašyta, prašoma tik dokumentų pataisymo; (3) laiškas galimai dubliuoja ankstesnį užsakymą iš sąrašo; (4) prašymas dviprasmiškas ar prieštaringas (neaišku, užsakyti ar tik teirautis kainos); (5) KIEKIO PROBLEMA — flaguok VISUS kiekio netikslumus, ne tik dviprasmybes: kiekis IŠVIS NENURODYTAS („kiekis" = null); dviprasmiškas — pvz., „2 dėž 24 vnt." (neaišku, ar 2 dėžės PO 24 vnt. = 48, ar 2 dėžės, kuriose iš viso 24 vnt.); „3 pak", kai nežinomas pakuotės dydis; kiekis be mato vieneto, kai prekė matuojama keliais būdais (metrai ar vienetai); laiške ir priede nurodyti SKIRTINGI kiekiai; kiekis nurodytas tik daliai prekių; kiekis su sąlyga („apie", „maždaug", „~", „priklausys nuo"); bet koks kitas neapibrėžtumas, dėl kurio užsakant galima suklysti. Kiekio įspėjime įvardink KONKREČIAS prekes ir kas neaišku, pvz.: „PASITIKSLINTI KIEKĮ prieš užsakant: „2 dėž 24 vnt." gali reikšti 48 vnt. (2×24) arba 24 vnt.; prekei X kiekis išvis nenurodytas". Įprastoms pastaboms šio lauko NENAUDOK — jei viskas aišku, palik null.
 - Atsakymo tekstus rašyk lietuvių kalba (prekes — originalo kalba, kaip laiške)."""
 
 _NULLABLE_STR = {"anyOf": [{"type": "string"}, {"type": "null"}]}
@@ -57,6 +67,7 @@ OUTPUT_SCHEMA = {
         "ar_uzsakymas": {"type": "boolean"},
         "pasitikejimas": {"type": "number"},
         "klientas": _NULLABLE_STR,
+        "kliento_imone": _NULLABLE_STR,
         "kliento_el_pastas": _NULLABLE_STR,
         "kliento_adresas": _NULLABLE_STR,
         "kliento_telefonas": _NULLABLE_STR,
@@ -70,10 +81,13 @@ OUTPUT_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "preke": {"type": "string"},
-                    "kiekis": {"type": "string"},
+                    "kodas": _NULLABLE_STR,
+                    "kiekis": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                    "vienetas": _NULLABLE_STR,
                     "pastabos": _NULLABLE_STR,
+                    "nuoroda": _NULLABLE_STR,
                 },
-                "required": ["preke", "kiekis", "pastabos"],
+                "required": ["preke", "kodas", "kiekis", "vienetas", "pastabos", "nuoroda"],
                 "additionalProperties": False,
             },
         },
@@ -82,7 +96,8 @@ OUTPUT_SCHEMA = {
         "santrauka": {"type": "string"},
         "ispejimas": _NULLABLE_STR,
     },
-    "required": ["ar_uzsakymas", "pasitikejimas", "klientas", "kliento_el_pastas",
+    "required": ["ar_uzsakymas", "pasitikejimas", "klientas", "kliento_imone",
+                 "kliento_el_pastas",
                  "kliento_adresas", "kliento_telefonas", "uzsakymo_data",
                  "pristatymo_data", "pasiulymo_terminas", "sutartis",
                  "prekes", "pastabos", "atnaujina_koda", "santrauka", "ispejimas"],
@@ -192,7 +207,7 @@ def analyze_email(client: anthropic.Anthropic, model: str, email: dict,
 
     if response.stop_reason == "refusal":
         return {
-            "ar_uzsakymas": False, "pasitikejimas": 0.0, "klientas": None,
+            "ar_uzsakymas": False, "pasitikejimas": 0.0, "klientas": None, "kliento_imone": None,
             "kliento_el_pastas": None, "kliento_adresas": None, "kliento_telefonas": None,
             "uzsakymo_data": None, "pristatymo_data": None, "pasiulymo_terminas": None,
             "sutartis": None, "atnaujina_koda": None,
@@ -205,6 +220,6 @@ def analyze_email(client: anthropic.Anthropic, model: str, email: dict,
     text_out = next((b.text for b in response.content if b.type == "text"), None)
     if text_out is None:
         raise RuntimeError(f"Netikėtas API atsakymas (stop_reason={response.stop_reason})")
-    result = json.loads(text_out)
+    result = prekes_mod.tvarkyti_analize(json.loads(text_out))  # švarus formatas kodu
     result["_usage"] = _usage_info(response, model)  # kainos apskaitai
     return result

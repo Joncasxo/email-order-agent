@@ -6,13 +6,14 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-STATUS_HEADERS = ["Kodas", "Klientas", "Telefonas", "Adresas", "El. paštas",
+STATUS_HEADERS = ["Kodas", "Klientas", "Įmonė", "Telefonas", "Adresas", "El. paštas",
                   "Data", "Pasiūlyti iki", "Statusas", "Sąskaita", "Mano pastabos",
                   "Atnaujinimai", "Santrauka", "Laiško tema"]
 
 DAY_HEADERS = ["Diena", "Atlikta", "Darbas", "Eiga / užrašai", "Tęsiasi (d.)", "Pradėta"]
 
-ITEM_HEADERS = ["Kodas", "Klientas", "Prekė", "Kiekis", "Prekės pastabos",
+ITEM_HEADERS = ["Kodas", "Klientas", "Prekė", "Prekės kodas", "Kiekis", "Vnt.",
+                "Prekės pastabos", "Nuoroda",
                 "Pristatymo data", "Data", "Statusas"]
 
 
@@ -32,7 +33,8 @@ def export_orders(orders: list, path: str, day_tasks: list = None):
     ws.append(STATUS_HEADERS)
     for o in orders:
         ws.append([
-            o.get("kodas"), o.get("klientas"), o.get("kliento_telefonas"),
+            o.get("kodas"), o.get("klientas"), o.get("kliento_imone"),
+            o.get("kliento_telefonas"),
             o.get("kliento_adresas"), o.get("kliento_el_pastas"),
             o.get("received_at"), o.get("pasiulymo_terminas"),
             o.get("statusas"),
@@ -40,7 +42,7 @@ def export_orders(orders: list, path: str, day_tasks: list = None):
             o.get("mano_pastabos"), o.get("atnaujinimai"),
             o.get("santrauka"), o.get("subject"),
         ])
-    _autosize(ws, [14, 22, 15, 30, 30, 16, 16, 11, 11, 35, 40, 40, 30])
+    _autosize(ws, [14, 22, 22, 15, 30, 30, 16, 16, 11, 11, 35, 40, 40, 30])
 
     ws2 = wb.create_sheet("Prekės")
     ws2.append(ITEM_HEADERS)
@@ -54,10 +56,12 @@ def export_orders(orders: list, path: str, day_tasks: list = None):
         for it in items:
             ws2.append([
                 o.get("kodas"), o.get("klientas"),
-                it.get("preke"), it.get("kiekis"), it.get("pastabos"),
+                it.get("preke"), it.get("kodas"),
+                it.get("kiekis") or ("nenurodyta" if it.get("preke") != "(neišskaidyta)" else ""),
+                it.get("vienetas"), it.get("pastabos"), it.get("nuoroda"),
                 o.get("pristatymo_data"), o.get("received_at"), o.get("statusas"),
             ])
-    _autosize(ws2, [14, 22, 45, 12, 28, 15, 16, 11])
+    _autosize(ws2, [14, 22, 45, 14, 10, 8, 28, 30, 15, 16, 11])
 
     if day_tasks:
         ws3 = wb.create_sheet("Dienos darbai")

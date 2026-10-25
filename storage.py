@@ -13,6 +13,8 @@ import re
 import sqlite3
 import threading
 
+import prekes as prekes_mod
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "uzsakymai.db")
 
@@ -39,6 +41,8 @@ _ORDER_COLUMNS = {
     # ir ar kas nors atsakė (❗ sąraše, nusiimamas peržiūrėjus)
     "uzklausti_tiekejai": "TEXT",
     "tiekejas_atsake": "INTEGER DEFAULT 0",
+    # Tvarkingesnis ištraukimas (2026-10): įmonė atskirai nuo asmens
+    "kliento_imone": "TEXT",
 }
 
 _DAY_COLUMNS = {
@@ -218,21 +222,23 @@ def record_processed(email: dict, analysis: dict, is_order: bool, priedai: str =
             c.execute("""INSERT INTO orders
                 (entry_id, store_id, kodas, conversation_id, priedai, sutartis,
                  received_at, sender, subject,
-                 klientas, kliento_el_pastas, kliento_adresas, kliento_telefonas,
+                 klientas, kliento_imone, kliento_el_pastas, kliento_adresas, kliento_telefonas,
                  uzsakymo_data, pristatymo_data, pasiulymo_terminas,
                  prekes_json, pastabos, mano_pastabos, santrauka, ispejimas,
                  pasitikejimas, statusas, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, '', ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, '', ?)""",
                 (email["entry_id"], email["store_id"], kodas,
                  email.get("conversation_id") or None, priedai or None,
                  analysis.get("sutartis"),
                  f"{order_dt:%Y-%m-%d %H:%M}",
                  f"{email['sender_name']} <{email['sender_email']}>", email["subject"],
-                 analysis.get("klientas"), analysis.get("kliento_el_pastas"),
+                 analysis.get("klientas"), analysis.get("kliento_imone"),
+                 analysis.get("kliento_el_pastas"),
                  analysis.get("kliento_adresas"), analysis.get("kliento_telefonas"),
                  analysis.get("uzsakymo_data"), analysis.get("pristatymo_data"),
                  analysis.get("pasiulymo_terminas"),
-                 json.dumps(analysis.get("prekes", []), ensure_ascii=False),
+                 json.dumps(prekes_mod.tvarkyti_prekes(analysis.get("prekes")),
+                            ensure_ascii=False),
                  analysis.get("pastabos"), analysis.get("santrauka"),
                  analysis.get("ispejimas"),
                  analysis.get("pasitikejimas"),
@@ -246,7 +252,8 @@ def record_processed(email: dict, analysis: dict, is_order: bool, priedai: str =
 def add_manual_order(data: dict) -> str:
     """Rankiniu būdu sukurtas užsakymas — be laiško. Kodas generuojamas tuo
     pačiu mechanizmu kaip AI atpažintiems (KODO_PREFIKSAS + inicialai + data, „!" jei
-    prioritetinė sutartis). data["prekes"] — sąrašas {preke, kiekis, pastabos}."""
+    prioritetinė sutartis). data["prekes"] — sąrašas {preke, kodas, kiekis, vienetas,
+    pastabos, nuoroda}."""
     import uuid
     with _lock, _conn() as c:
         try:
@@ -263,23 +270,24 @@ def add_manual_order(data: dict) -> str:
         c.execute("""INSERT INTO orders
             (entry_id, store_id, kodas, conversation_id, priedai, sutartis,
              received_at, sender, subject,
-             klientas, kliento_el_pastas, kliento_adresas, kliento_telefonas,
+             klientas, kliento_imone, kliento_el_pastas, kliento_adresas, kliento_telefonas,
              uzsakymo_data, pristatymo_data, pasiulymo_terminas,
              prekes_json, pastabos, mano_pastabos, santrauka,
              pasitikejimas, statusas, created_at)
-            VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', ?)""",
+            VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', ?)""",
             (f"manual-{uuid.uuid4()}", "manual", kodas,
              (data.get("sutartis") or "").strip() or None,
              f"{order_dt:%Y-%m-%d %H:%M}",
              "rankinis įrašas", "(rankinis užsakymas)",
-             (data.get("klientas") or "").strip(),
-             (data.get("kliento_el_pastas") or "").strip() or None,
+             prekes_mod.asmuo(data.get("klientas")) or "",
+             prekes_mod.svarus(data.get("kliento_imone")),
+             prekes_mod.el_pastas(data.get("kliento_el_pastas")),
              (data.get("kliento_adresas") or "").strip() or None,
-             (data.get("kliento_telefonas") or "").strip() or None,
+             prekes_mod.telefonas(data.get("kliento_telefonas")),
              f"{order_dt:%Y-%m-%d}",
              (data.get("pristatymo_data") or "").strip() or None,
              (data.get("pasiulymo_terminas") or "").strip() or None,
-             json.dumps(data.get("prekes") or [], ensure_ascii=False),
+             json.dumps(prekes_mod.tvarkyti_prekes(data.get("prekes")), ensure_ascii=False),
              None,
              (data.get("mano_pastabos") or "").strip(),
              "Rankiniu būdu sukurtas užsakymas.",
@@ -321,8 +329,7 @@ def order_by_conversation(conversation_id: str):
         items = json.loads(o.get("prekes_json") or "[]")
     except Exception:
         items = []
-    o["prekes_santrauka"] = "; ".join(
-        f"{it.get('preke')} ({it.get('kiekis')})" for it in items[:6])
+    o["prekes_santrauka"] = prekes_mod.trumpas_sarasas(items, 6)
     return o
 
 
@@ -341,9 +348,7 @@ def recent_orders_summary(days: int = 45, limit: int = 15) -> str:
             items = json.loads(r["prekes_json"] or "[]")
         except Exception:
             items = []
-        prekes = "; ".join(f"{it.get('preke')} ({it.get('kiekis')})" for it in items[:4])
-        if len(items) > 4:
-            prekes += f" … (+{len(items) - 4})"
+        prekes = prekes_mod.trumpas_sarasas(items, 4)
         lines.append(f"{r['kodas']} | {r['klientas'] or '?'} | {r['received_at']} | {prekes}")
     return "\n".join(lines)
 
@@ -405,6 +410,29 @@ def set_order_status(order_id: int, status: str):
 def set_order_priedai(order_id: int, priedai: str):
     with _lock, _conn() as c:
         c.execute("UPDATE orders SET priedai=? WHERE id=?", (priedai or None, order_id))
+
+
+# Laukai, kuriuos žmogus gali pataisyti užsakymo kortelėje.
+# Kodas NEKEIČIAMAS (pagal jį sekamos tiekėjų užklausos temose).
+REDAGUOJAMI_LAUKAI = ("klientas", "kliento_imone", "kliento_telefonas", "kliento_el_pastas",
+                      "kliento_adresas", "sutartis", "pasiulymo_terminas", "pristatymo_data")
+
+
+def update_order_fields(order_id: int, fields: dict, prekes: list = None):
+    """Žmogaus pataisymai kortelėje: kontaktai, datos, sutartis ir prekių sąrašas.
+    Reikšmės sutvarkomos tuo pačiu būdu kaip po AI ištraukimo."""
+    a = {k: fields.get(k) for k in REDAGUOJAMI_LAUKAI if k in fields}
+    if prekes is not None:
+        a["prekes"] = prekes
+    a = prekes_mod.tvarkyti_analize(a)
+    sets = {k: a.get(k) for k in REDAGUOJAMI_LAUKAI if k in fields}
+    if prekes is not None:
+        sets["prekes_json"] = json.dumps(a["prekes"], ensure_ascii=False)
+    if not sets:
+        return
+    with _lock, _conn() as c:
+        c.execute("UPDATE orders SET " + ", ".join(f"{k}=?" for k in sets) + " WHERE id=?",
+                  (*sets.values(), order_id))
 
 
 # ---------------- Dienos darbai ----------------
@@ -517,11 +545,15 @@ def apply_order_update(kodas: str, analysis: dict, email: dict) -> bool:
             items = json.loads(o.get("prekes_json") or "[]")
         except Exception:
             items = []
-        have = {(it.get("preke") or "").strip().lower() for it in items}
+        def _raktas(it):
+            return ((it.get("preke") or "").strip().lower(),
+                    (it.get("kodas") or "").strip().lower())
+        have = {_raktas(it) for it in items}
         added = 0
-        for it in analysis.get("prekes") or []:
-            if (it.get("preke") or "").strip().lower() not in have:
+        for it in prekes_mod.tvarkyti_prekes(analysis.get("prekes")):
+            if _raktas(it) not in have:
                 items.append(it)
+                have.add(_raktas(it))
                 added += 1
         if added:
             entry += f" (pridėta prekių: {added})"
@@ -532,7 +564,7 @@ def apply_order_update(kodas: str, analysis: dict, email: dict) -> bool:
         sets = {"prekes_json": json.dumps(items, ensure_ascii=False),
                 "atnaujinimai": log, "atnaujinta": 1}
         for field in ("pristatymo_data", "pasiulymo_terminas",
-                      "kliento_telefonas", "kliento_adresas"):
+                      "kliento_telefonas", "kliento_adresas", "kliento_imone"):
             if analysis.get(field):
                 sets[field] = analysis[field]
 

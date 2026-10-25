@@ -16,6 +16,7 @@ import sqlite3
 import tempfile
 import threading
 import traceback
+import webbrowser
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait as futures_wait
 from tkinter import filedialog, messagebox, ttk
@@ -29,8 +30,20 @@ import html_perziura
 import extractor
 import graph_client
 import outlook_client
+import prekes as prekes_mod
 import share
 import storage
+
+# Moderni išvaizda (ttkbootstrap). Jei neįdiegta — programa veikia su įprasta tema.
+try:
+    import ttkbootstrap as tb
+    from ttkbootstrap.widgets import DateEntry as _TbDateEntry
+    TB = True
+except Exception:
+    tb = None
+    _TbDateEntry = None
+    TB = False
+TEMA = "cosmo"
 
 MODELS = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"]
 
@@ -121,6 +134,373 @@ def _terminas(o: dict):
     return f"{y}-{mo}-{d}", iki
 
 
+
+# ---------------- Bendri UI pagalbininkai ----------------
+
+def _bs(kw: dict, style):
+    """ttkbootstrap spalvinis stilius (jei tema įdiegta) — kitaip be jo."""
+    if TB and style:
+        kw["bootstyle"] = style
+    return kw
+
+
+def _tkkw() -> dict:
+    """Klasikiniams tk valdikliams: kad tema neperrašytų mūsų spalvų."""
+    return {"autostyle": False} if TB else {}
+
+
+def _btn(parent, text, command, style=None, **kw):
+    return ttk.Button(parent, text=text, command=command, **_bs(kw, style))
+
+
+def _date_field(parent, var, width=11):
+    """Datos laukas su kalendoriumi (jei yra ttkbootstrap), kitaip — paprastas laukas."""
+    if TB:
+        try:
+            de = _TbDateEntry(parent, dateformat="%Y-%m-%d", width=width, firstweekday=0)
+            de.entry.delete(0, "end")
+            de.entry.configure(textvariable=var)
+            return de
+        except Exception:
+            pass
+    return ttk.Entry(parent, textvariable=var, width=width)
+
+
+class Tooltip:
+    """Paaiškinimas užvedus pelę. Su tekstu — automatinis; be teksto — show()/hide() ranka."""
+
+    def __init__(self, widget, text: str = "", delay: int = 450):
+        self.widget, self.text, self.delay = widget, text, delay
+        self.win = None
+        self._after = None
+        if text:
+            widget.bind("<Enter>", lambda e: self._schedule(), add="+")
+            widget.bind("<Leave>", lambda e: self.hide(), add="+")
+            widget.bind("<ButtonPress>", lambda e: self.hide(), add="+")
+
+    def _schedule(self):
+        self._cancel()
+        self._after = self.widget.after(self.delay, lambda: self.show(
+            self.widget.winfo_pointerx() + 14, self.widget.winfo_pointery() + 18, self.text))
+
+    def _cancel(self):
+        if self._after:
+            try:
+                self.widget.after_cancel(self._after)
+            except tk.TclError:
+                pass
+            self._after = None
+
+    def show(self, x, y, text):
+        self._close()
+        if not text:
+            return
+        try:
+            tw = tk.Toplevel(self.widget)
+            tw.wm_overrideredirect(True)
+            tw.attributes("-topmost", True)
+            lbl = tk.Label(tw, text=text, justify="left", padx=9, pady=6,
+                           font=("Segoe UI", 9), wraplength=460, **_tkkw())
+            lbl.configure(background="#1f2937", foreground="#f9fafb")
+            lbl.pack()
+            tw.wm_geometry(f"+{x}+{y}")
+            self.win = tw
+        except tk.TclError:
+            self.win = None
+
+    def _close(self):
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except tk.TclError:
+                pass
+            self.win = None
+
+    def hide(self):
+        self._cancel()
+        self._close()
+
+
+UNIT_CHOICES = ["vnt.", "kompl.", "pak.", "dėž.", "m", "m²", "m³", "kg", "l", "t",
+                "rul.", "pad.", "por.", "val."]
+
+
+class ItemsEditor(ttk.Frame):
+    """Prekių lentelė, kurią galima taisyti tiesiai langeliuose.
+
+    Dukart spustelėjus langelį atsiranda laukas: Enter — išsaugo, Esc — atšaukia,
+    Tab / Shift+Tab — į kitą / ankstesnį langelį. Eilutės be kiekio pažymimos
+    oranžiškai — kad iš karto matytųsi, ką reikia pasitikslinti."""
+
+    COLS = ("nr", "preke", "kodas", "kiekis", "vienetas", "pastabos", "nuoroda")
+    EDIT_COLS = ("preke", "kodas", "kiekis", "vienetas", "pastabos", "nuoroda")
+    HEAD = {"nr": "#", "preke": "Prekė", "kodas": "Kodas", "kiekis": "Kiekis",
+            "vienetas": "Vnt.", "pastabos": "Pastabos", "nuoroda": "Nuoroda"}
+    WIDTH = {"nr": (32, False), "preke": (200, True), "kodas": (90, False),
+             "kiekis": (60, False), "vienetas": (52, False), "pastabos": (140, True),
+             "nuoroda": (70, False)}
+
+    def __init__(self, master, on_change=None, height=6):
+        super().__init__(master)
+        self.on_change = on_change
+        self.items = []
+        self._editor = None
+        self._editable = True
+        self._tip_key = None
+
+        fr = ttk.Frame(self)
+        fr.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(fr, columns=self.COLS, show="headings", height=height,
+                                 selectmode="extended")
+        for c in self.COLS:
+            w, stretch = self.WIDTH[c]
+            self.tree.heading(c, text=self.HEAD[c])
+            self.tree.column(c, width=w, minwidth=30, stretch=stretch,
+                             anchor="center" if c in ("nr", "kiekis", "vienetas", "nuoroda")
+                             else "w")
+        self.tree.tag_configure("truksta", background="#fff1d6")
+        vsb = ttk.Scrollbar(fr, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", pady=(4, 0))
+        self.btn_add = _btn(bar, "➕ Pridėti prekę", self.add_row, "success-outline")
+        self.btn_add.pack(side="left")
+        self.btn_del = _btn(bar, "🗑 Pašalinti pažymėtas", self.delete_selected,
+                            "secondary-outline")
+        self.btn_del.pack(side="left", padx=(6, 0))
+        self.hint = ttk.Label(bar, text="Dukart spustelėkite langelį, kad pataisytumėte",
+                              foreground="#6b7280")
+        self.hint.pack(side="right")
+
+        self.tip = Tooltip(self.tree)
+        self.tree.bind("<Double-1>", self._on_double)
+        self.tree.bind("<Return>", self._on_enter)
+        self.tree.bind("<F2>", self._on_enter)
+        self.tree.bind("<Delete>", lambda e: self.delete_selected())
+        self.tree.bind("<Button-3>", self._on_right_click)
+        self.tree.bind("<Motion>", self._on_motion)
+        self.tree.bind("<Leave>", lambda e: self._hide_tip())
+        self.tree.bind("<MouseWheel>", lambda e: (self.commit_edit(), self._hide_tip()), add="+")
+
+    # --- duomenys ---
+
+    def set_items(self, items, editable: bool = True):
+        self.cancel_edit()
+        norm = []
+        for it in items or []:
+            e = prekes_mod.prekes_eilute(it)
+            if e is not None:
+                norm.append(e)
+        self.items = norm
+        self._editable = editable
+        state = "normal" if editable else "disabled"
+        self.btn_add.config(state=state)
+        self.btn_del.config(state=state)
+        self.hint.config(text="Dukart spustelėkite langelį, kad pataisytumėte" if editable else "")
+        self.render()
+
+    def get_items(self) -> list:
+        self.commit_edit()
+        return [dict(it) for it in self.items]
+
+    def render(self, select: int = None):
+        self.tree.delete(*self.tree.get_children())
+        for i, it in enumerate(self.items):
+            kiekis = str(it.get("kiekis") or "")
+            self.tree.insert("", "end", iid=str(i),
+                             tags=("truksta",) if not kiekis.strip() else (),
+                             values=(i + 1, it.get("preke") or "", it.get("kodas") or "",
+                                     kiekis, it.get("vienetas") or "",
+                                     it.get("pastabos") or "",
+                                     "🔗" if it.get("nuoroda") else ""))
+        if select is not None and 0 <= select < len(self.items):
+            self.tree.selection_set(str(select))
+            self.tree.focus(str(select))
+            self.tree.see(str(select))
+
+    def _changed(self):
+        if self.on_change:
+            self.on_change()
+
+    # --- veiksmai ---
+
+    def add_row(self):
+        if not self._editable:
+            return
+        self.commit_edit()
+        self.items.append({"preke": "", "kodas": None, "kiekis": "", "vienetas": None,
+                           "pastabos": None, "nuoroda": None})
+        idx = len(self.items) - 1
+        self.render(select=idx)
+        self._changed()
+        self.edit_cell(str(idx), "preke")
+
+    def delete_selected(self):
+        if not self._editable:
+            return
+        self.commit_edit()
+        sel = sorted((int(i) for i in self.tree.selection()), reverse=True)
+        if not sel:
+            messagebox.showinfo("Pašalinti", "Pirma pažymėkite prekės eilutę.", parent=self)
+            return
+        for i in sel:
+            if i < len(self.items):
+                del self.items[i]
+        self.render(select=min(sel[-1], len(self.items) - 1) if self.items else None)
+        self._changed()
+
+    # --- redagavimas langelyje ---
+
+    def edit_cell(self, iid: str, col: str):
+        if not self._editable or col not in self.EDIT_COLS:
+            return
+        self.commit_edit()
+        self.tree.see(iid)
+        self.tree.update_idletasks()
+        bbox = self.tree.bbox(iid, col)
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        idx = int(iid)
+        val = str(self.items[idx].get(col) or "")
+        if col == "vienetas":
+            ed = ttk.Combobox(self.tree, values=UNIT_CHOICES)
+            ed.bind("<<ComboboxSelected>>", lambda e: self.commit_edit())
+        else:
+            ed = ttk.Entry(self.tree)
+        ed.insert(0, val)
+        ed.select_range(0, "end")
+        ed.icursor("end")
+        # siauri stulpeliai (kodas, nuoroda) redaguojant praplatinami
+        min_w = {"nuoroda": 320, "kodas": 140, "vienetas": 90, "kiekis": 80}.get(col, w)
+        ed.place(x=x, y=y, width=max(w, min_w), height=h)
+        ed.focus_set()
+        self._editor = (ed, idx, col)
+        ed.bind("<Return>", lambda e: (self.commit_edit(), "break")[1])
+        ed.bind("<KP_Enter>", lambda e: (self.commit_edit(), "break")[1])
+        ed.bind("<Escape>", lambda e: (self.cancel_edit(), "break")[1])
+        ed.bind("<Tab>", lambda e: (self._move(1), "break")[1])
+        ed.bind("<Shift-Tab>", lambda e: (self._move(-1), "break")[1])
+        ed.bind("<FocusOut>", lambda e: self.after(120, self._focus_check))
+
+    def _focus_check(self):
+        """Fokusas paliko lauką (bet ne į jo išskleidžiamą sąrašą) — išsaugome."""
+        if not self._editor:
+            return
+        ed = self._editor[0]
+        try:
+            f = str(self.tk.call("focus"))
+        except tk.TclError:
+            f = ""
+        if f and f.startswith(str(ed)):
+            return
+        self.commit_edit()
+
+    def commit_edit(self):
+        if not self._editor:
+            return
+        ed, idx, col = self._editor
+        self._editor = None
+        try:
+            val = ed.get().strip()
+            ed.destroy()
+        except tk.TclError:
+            return
+        if idx >= len(self.items):
+            return
+        old = str(self.items[idx].get(col) or "")
+        if old != val:
+            self.items[idx][col] = val if col in ("preke", "kiekis") else (val or None)
+            self.render(select=idx)
+            self._changed()
+
+    def cancel_edit(self):
+        if self._editor:
+            ed = self._editor[0]
+            self._editor = None
+            try:
+                ed.destroy()
+            except tk.TclError:
+                pass
+
+    def _move(self, step: int):
+        if not self._editor:
+            return
+        _ed, idx, col = self._editor
+        self.commit_edit()
+        cols = list(self.EDIT_COLS)
+        pos = cols.index(col) + step
+        if pos >= len(cols):
+            pos, idx = 0, idx + 1
+        elif pos < 0:
+            pos, idx = len(cols) - 1, idx - 1
+        if 0 <= idx < len(self.items):
+            self.edit_cell(str(idx), cols[pos])
+
+    def _on_double(self, e):
+        if not self._editable:
+            return
+        region = self.tree.identify_region(e.x, e.y)
+        if region == "nothing":
+            self.add_row()
+            return
+        if region != "cell":
+            return
+        iid = self.tree.identify_row(e.y)
+        col = self.COLS[int(self.tree.identify_column(e.x)[1:]) - 1]
+        self.edit_cell(iid, "preke" if col == "nr" else col)
+
+    def _on_enter(self, _e=None):
+        iid = self.tree.focus()
+        if iid:
+            self.edit_cell(iid, "preke")
+        return "break"
+
+    def _on_right_click(self, e):
+        iid = self.tree.identify_row(e.y)
+        if not iid:
+            return
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        idx = int(iid)
+        m = tk.Menu(self, tearoff=0)
+        if self._editable:
+            m.add_command(label="✎ Taisyti", command=lambda: self.edit_cell(iid, "preke"))
+        link = self.items[idx].get("nuoroda") if idx < len(self.items) else None
+        if link:
+            m.add_command(label="🔗 Atidaryti nuorodą", command=lambda: webbrowser.open(link))
+        if self._editable:
+            m.add_separator()
+            m.add_command(label="🗑 Pašalinti eilutę", command=self.delete_selected)
+        m.tk_popup(e.x_root, e.y_root)
+
+    # --- pilnas tekstas užvedus pelę ---
+
+    def _on_motion(self, e):
+        if self.tree.identify_region(e.x, e.y) != "cell":
+            self._hide_tip()
+            return
+        iid = self.tree.identify_row(e.y)
+        col = self.COLS[int(self.tree.identify_column(e.x)[1:]) - 1]
+        key = (iid, col)
+        if key == self._tip_key:
+            return
+        self._hide_tip()
+        if not iid or col not in ("preke", "kodas", "pastabos", "nuoroda"):
+            return
+        val = str(self.items[int(iid)].get(col) or "") if int(iid) < len(self.items) else ""
+        if col == "nuoroda" or len(val) > 28:
+            self._tip_key = key
+            self.tip.show(e.x_root + 14, e.y_root + 18, val)
+
+    def _hide_tip(self):
+        self._tip_key = None
+        self.tip.hide()
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -142,8 +522,11 @@ class App:
         shutil.rmtree(TEMP_ATT_ROOT, ignore_errors=True)  # senų laikinų priedų valymas
 
         root.title("Užsakymų agentas — Outlook + Claude")
-        root.geometry("1250x680")
-        root.minsize(950, 520)
+        # lango dydis — pagal ekraną (kad tilptų ir nešiojamame kompiuteryje)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(1600, sw - 60), min(900, sh - 100)
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        root.minsize(1000, 600)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
@@ -162,73 +545,135 @@ class App:
 
     # ---------------- UI ----------------
 
+    # Filtrai „Rodyti": vidinis kodas -> rodomas tekstas
+    FILTRAI = [("visi", "Visi"), ("neuzbaigti", "⏳ Neužbaigti"),
+               ("nauji", "🆕 Nauji (be statuso)"), ("užklausta", "Užklausta"),
+               ("pasiūlyta", "Pasiūlyta"), ("laimėta", "Laimėta"),
+               ("nelaimėta", "Nelaimėta"), ("užsakyta", "Užsakyta"),
+               ("uzbaigti", "✔ Užbaigti")]
+    LAIKOTARPIAI = [("Visas laikas", None), ("Šiandien", 0), ("Paskutinės 7 d.", 7),
+                    ("Paskutinės 30 d.", 30), ("Šis mėnuo", -1), ("Pasirinktos datos", "x")]
+    # Kortelės laukai: (raktas, pavadinimas, eilutė, stulpelis, per visą plotį)
+    KORTELES_LAUKAI = [
+        ("klientas", "Klientas", 0, 0, False), ("kliento_imone", "Įmonė", 0, 1, False),
+        ("kliento_telefonas", "Telefonas", 1, 0, False),
+        ("kliento_el_pastas", "El. paštas", 1, 1, False),
+        ("kliento_adresas", "Adresas", 2, 0, True),
+        ("sutartis", "Sutartis", 3, 0, False),
+        ("pasiulymo_terminas", "Pasiūlyti iki", 3, 1, False),
+        ("pristatymo_data", "Pristatymas", 4, 0, True),
+    ]
+    STULPELIU_PAAISKINIMAI = {
+        "atn": "⚠  AI įspėjimas — būtinai perskaitykite prieš vykdant\n"
+               "🔔  grandinėje atėjo naujas laiškas (papildymas)\n"
+               "❗  atsakė tiekėjas į užklausą\n\n🔔 ir ❗ nusiima peržiūrėjus užsakymą.",
+        "terminas": "Iki kada pateikti pasiūlymą.\nRaudonai — artėja, pilkai — jau praėjo.",
+        "priedai": "Kiek priedų (be parašo logotipų) turi laiškas.",
+        "saskaita": "✅  sąskaita išrašyta\n◐ / 🟠  išrašyta dalinai",
+        "statusas": "Užsakymo eiga. Keičiama dešinėje, laukelyje „Statusas“.",
+    }
+
     def _build_ui(self):
-        toolbar = ttk.Frame(self.root, padding=(8, 6))
+        self._card_id = None          # kuris užsakymas atvertas kortelėje
+        self._card_dirty = False      # ar kortelėje yra neišsaugotų pataisymų
+        self._card_loading = False
+        self._card_snapshot = None
+        self._period_prog = False     # laikotarpį nustato programa (ne žmogus)
+        self._refresh_after = None
+        self._tree_tip_key = None
+
+        # --- Viršutinė juosta: tik dažniausi veiksmai, kiti — „Daugiau" ---
+        toolbar = ttk.Frame(self.root, padding=(10, 8, 10, 4))
         toolbar.pack(fill="x")
 
-        self.btn_check = ttk.Button(toolbar, text="🔄  Tikrinti dabar", command=self._check_now)
+        self.btn_check = _btn(toolbar, "🔄  Tikrinti paštą", self._check_now, "primary")
         self.btn_check.pack(side="left")
+        Tooltip(self.btn_check, "Patikrinti naujus laiškus dabar")
 
         self.auto_var = tk.BooleanVar(value=bool(self.cfg["auto_check"]))
-        ttk.Checkbutton(toolbar, text="Automatinis tikrinimas", variable=self.auto_var,
-                        command=self._toggle_auto).pack(side="left", padx=(12, 0))
-        self.lbl_interval = ttk.Label(toolbar, text=f"(kas {self.cfg['check_interval_min']} min.)")
-        self.lbl_interval.pack(side="left", padx=(4, 0))
+        self.lbl_interval = ttk.Checkbutton(
+            toolbar, text=f"Automatiškai kas {self.cfg['check_interval_min']} min.",
+            variable=self.auto_var, command=self._toggle_auto,
+            **_bs({}, "round-toggle"))
+        self.lbl_interval.pack(side="left", padx=(12, 0))
 
-        ttk.Button(toolbar, text="➕  Naujas",
-                   command=self._new_order_dialog).pack(side="left", padx=(12, 0))
-        ttk.Button(toolbar, text="📥  Importuoti seniau",
-                   command=self._import_history).pack(side="left", padx=(8, 0))
-        ttk.Button(toolbar, text="🖐  Rinktis laiškus",
-                   command=self._open_picker).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="📅  Dienos darbai",
-                   command=self._open_day_tasks).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="📑  Sutartys",
-                   command=self._open_contracts).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="📊  Eksportas",
-                   command=self._export).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="📤  Siųsti peržiūrą",
-                   command=self._siusti_perziura).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="⚙  Nustatymai",
-                   command=self._open_settings).pack(side="right")
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=12)
 
-        filter_bar = ttk.Frame(self.root, padding=(8, 0))
-        filter_bar.pack(fill="x")
-        ttk.Label(filter_bar, text="Rodyti:").pack(side="left")
+        b = _btn(toolbar, "➕  Naujas užsakymas", self._new_order_dialog, "success-outline")
+        b.pack(side="left")
+        Tooltip(b, "Įvesti užsakymą ranka (be laiško)")
+        b = _btn(toolbar, "📅  Dienos darbai", self._open_day_tasks, "secondary-outline")
+        b.pack(side="left", padx=(6, 0))
+        b = _btn(toolbar, "📑  Sutartys", self._open_contracts, "secondary-outline")
+        b.pack(side="left", padx=(6, 0))
+
+        more = ttk.Menubutton(toolbar, text="⋯  Daugiau", **_bs({}, "secondary-outline"))
+        more.pack(side="left", padx=(6, 0))
+        m = tk.Menu(more, tearoff=0)
+        m.add_command(label="📥  Importuoti senesnius laiškus…", command=self._import_history)
+        m.add_command(label="🖐  Rinktis laiškus analizei…", command=self._open_picker)
+        m.add_separator()
+        m.add_command(label="📊  Eksportuoti matomus į Excel…",
+                      command=lambda: self._export(visible_only=True))
+        m.add_command(label="📊  Eksportuoti visus į Excel…", command=self._export)
+        m.add_separator()
+        m.add_command(label="📤  Siųsti peržiūrą vadovui…", command=self._siusti_perziura)
+        more["menu"] = m
+
+        b = _btn(toolbar, "⚙  Nustatymai", self._open_settings, "secondary-link")
+        b.pack(side="right")
+
+        # --- Viena filtrų juosta ---
+        fbar = ttk.Frame(self.root, padding=(10, 4, 10, 6))
+        fbar.pack(fill="x")
+
+        ttk.Label(fbar, text="Rodyti").pack(side="left")
         self.filter_var = tk.StringVar(value="visi")
-        for val, text in [("visi", "Visus"), ("nauji", "Naujus"),
-                          ("užklausta", "Užklausta"), ("pasiūlyta", "Pasiūlyta"),
-                          ("laimėta", "Laimėta"), ("nelaimėta", "Nelaimėta"),
-                          ("užsakyta", "Užsakyta"),
-                          ("neuzbaigti", "⏳ Neužbaigti"), ("uzbaigti", "✔ Užbaigti")]:
-            ttk.Radiobutton(filter_bar, text=text, value=val, variable=self.filter_var,
-                            command=self._refresh_orders).pack(side="left", padx=4)
-        ttk.Button(filter_bar, text="📊 Eksportuoti matomus",
-                   command=lambda: self._export(visible_only=True)).pack(side="right")
+        self.filter_combo = ttk.Combobox(fbar, state="readonly", width=24)
+        self.filter_combo.pack(side="left", padx=(6, 14))
+        self.filter_combo.bind("<<ComboboxSelected>>", self._on_filter_pick)
 
-        date_bar = ttk.Frame(self.root, padding=(8, 4))
-        date_bar.pack(fill="x")
-        ttk.Label(date_bar, text="Laikotarpis:").pack(side="left")
+        ttk.Label(fbar, text="Laikotarpis").pack(side="left")
+        self.period_combo = ttk.Combobox(fbar, state="readonly", width=17,
+                                         values=[t for t, _ in self.LAIKOTARPIAI])
+        self.period_combo.set("Visas laikas")
+        self.period_combo.pack(side="left", padx=(6, 6))
+        self.period_combo.bind("<<ComboboxSelected>>", self._on_period_pick)
         self.date_from = tk.StringVar()
         self.date_to = tk.StringVar()
-        ttk.Entry(date_bar, textvariable=self.date_from, width=12).pack(side="left", padx=(4, 2))
-        ttk.Label(date_bar, text="–").pack(side="left")
-        ttk.Entry(date_bar, textvariable=self.date_to, width=12).pack(side="left", padx=(2, 6))
-        for text, days in [("Šiandien", 0), ("7 d.", 7), ("30 d.", 30), ("Šis mėnuo", -1)]:
-            ttk.Button(date_bar, text=text, width=9,
-                       command=lambda d=days: self._set_period(d)).pack(side="left", padx=2)
-        ttk.Button(date_bar, text="Visi", width=6,
-                   command=lambda: self._set_period(None)).pack(side="left", padx=2)
-        ttk.Label(date_bar, text="  Paieška:").pack(side="left", padx=(10, 2))
-        self.search_var = tk.StringVar()
-        se = ttk.Entry(date_bar, textvariable=self.search_var, width=22)
-        se.pack(side="left")
-        se.bind("<Return>", lambda e: self._refresh_orders())
-        ttk.Button(date_bar, text="🔍 Filtruoti",
-                   command=self._refresh_orders).pack(side="left", padx=6)
+        _date_field(fbar, self.date_from).pack(side="left")
+        ttk.Label(fbar, text="–").pack(side="left", padx=3)
+        _date_field(fbar, self.date_to).pack(side="left")
+        self.date_from.trace_add("write", self._on_date_typed)
+        self.date_to.trace_add("write", self._on_date_typed)
 
+        ttk.Label(fbar, text="🔍").pack(side="left", padx=(16, 4))
+        self.search_var = tk.StringVar()
+        se = ttk.Entry(fbar, textvariable=self.search_var, width=26)
+        se.pack(side="left")
+        Tooltip(se, "Ieško pagal kodą, klientą, laiško temą, prekes ir jūsų pastabas.\n"
+                    "Rezultatai rodomi iškart rašant.")
+        self.search_var.trace_add("write", lambda *a: self._refresh_later())
+        se.bind("<Escape>", lambda e: self.search_var.set(""))
+        clr = _btn(fbar, "✕", lambda: self.search_var.set(""), "secondary-link", width=3)
+        clr.pack(side="left")
+        Tooltip(clr, "Išvalyti paiešką")
+
+        self.count_var = tk.StringVar()
+        ttk.Label(fbar, textvariable=self.count_var, foreground="#6b7280").pack(side="right")
+
+        # --- Būsenos juosta (apačioje) ---
+        status_bar = ttk.Frame(self.root, padding=(10, 3))
+        status_bar.pack(fill="x", side="bottom")
+        self.status_var = tk.StringVar(value="Paruošta.")
+        ttk.Label(status_bar, textvariable=self.status_var, foreground="#555").pack(side="left")
+        ttk.Label(status_bar, foreground="#8a8a8a",
+                  text="⚠ AI įspėjimas   🔔 naujas laiškas   ❗ atsakė tiekėjas   "
+                       "📎 priedai   ✅ sąskaita").pack(side="right")
+
+        # --- Pagrindinė dalis: sąrašas kairėje, kortelė dešinėje ---
         main = ttk.PanedWindow(self.root, orient="horizontal")
-        main.pack(fill="both", expand=True, padx=8, pady=6)
+        main.pack(fill="both", expand=True, padx=10, pady=(0, 4))
 
         left = ttk.Frame(main)
         main.add(left, weight=3)
@@ -237,7 +682,7 @@ class App:
                 "priedai", "statusas", "saskaita")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
         self.tree.heading("atn", text="🔔")
-        self.tree.column("atn", width=36, stretch=False, anchor="center")
+        self.tree.column("atn", width=40, stretch=False, anchor="center")
         self.tree.heading("kodas", text="Kodas")
         self.tree.heading("terminas", text="⏰ Pateikti iki")
         self.tree.heading("gauta", text="Data")
@@ -246,12 +691,12 @@ class App:
         self.tree.heading("priedai", text="📎")
         self.tree.heading("statusas", text="Statusas")
         self.tree.heading("saskaita", text="Sąsk.")
-        self.tree.column("kodas", width=110, minwidth=90, stretch=False)
-        self.tree.column("terminas", width=125, minwidth=105, stretch=False)
-        self.tree.column("gauta", width=115, minwidth=90, stretch=False)
-        self.tree.column("klientas", width=165, minwidth=110, stretch=False)
-        self.tree.column("prekes", width=250, minwidth=140)
-        self.tree.column("priedai", width=45, stretch=False, anchor="center")
+        self.tree.column("kodas", width=105, minwidth=90, stretch=False)
+        self.tree.column("terminas", width=140, minwidth=105, stretch=False)
+        self.tree.column("gauta", width=140, minwidth=90, stretch=False)
+        self.tree.column("klientas", width=140, minwidth=100, stretch=False)
+        self.tree.column("prekes", width=170, minwidth=120)
+        self.tree.column("priedai", width=42, stretch=False, anchor="center")
         self.tree.column("statusas", width=85, minwidth=70, stretch=False)
         self.tree.column("saskaita", width=50, stretch=False, anchor="center")
         for tag, color in STATUS_COLORS.items():
@@ -272,47 +717,215 @@ class App:
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Button-3>", self._on_tree_right_click)
+        self.tree.bind("<Motion>", self._on_tree_motion)
+        self.tree.bind("<Leave>", lambda e: self._tree_tip_hide())
+        self._tree_tip = Tooltip(self.tree)
 
-        right = ttk.Frame(main)
+        right = ttk.Frame(main, padding=(10, 0, 0, 0))
         main.add(right, weight=2)
+        self._build_card(right)
 
-        btns = ttk.Frame(right)
-        btns.pack(fill="x", pady=(0, 4))
-        ttk.Button(btns, text="✉ Atidaryti laišką", command=self._open_email).pack(side="left")
-        ttk.Button(btns, text="📎 Priedai", command=self._open_attachments).pack(side="left", padx=4)
-        ttk.Button(btns, text="📨 Rašyti tiekėjui",
-                   command=self._write_supplier).pack(side="left", padx=(0, 4))
-        ttk.Button(btns, text="📮 Užklausos",
-                   command=self._inquiries_window).pack(side="left", padx=(0, 4))
-        ttk.Label(btns, text="Statusas:").pack(side="left", padx=(10, 2))
-        self.status_combo = ttk.Combobox(btns, state="disabled", width=11)
-        self.status_combo.pack(side="left")
+        # Pradinė riba: sąrašas ~56 %, kortelė ~44 % lango pločio
+        # (kitaip platus sąrašas suspaudžia kortelę iki plyšio)
+        def _pradine_riba(e=None):
+            w = main.winfo_width()
+            if w < 400:          # langas dar neatsidarė — palaukiame
+                return
+            main.unbind("<Configure>")
+            try:
+                main.sashpos(0, int(w * 0.56))
+            except tk.TclError:
+                pass
+        main.bind("<Configure>", _pradine_riba)
+
+        self.root.bind_all("<Control-s>", lambda e: self._save_card())
+        self.root.bind_all("<Control-S>", lambda e: self._save_card())
+
+    def _build_card(self, right):
+        """Dešinė pusė: užsakymo kortelė, kurią galima taisyti."""
+        self.card_empty = ttk.Label(right, anchor="center", justify="center",
+                                    foreground="#8a8a8a", font=("Segoe UI", 11),
+                                    text="Pasirinkite užsakymą sąraše kairėje.\n\n"
+                                         "Čia matysite ir galėsite pataisyti\n"
+                                         "kliento duomenis ir prekes.")
+        self.card = ttk.Frame(right)
+
+        # Antraštė: kodas + trumpa informacija; šalinimas — atokiau nuo kasdienių mygtukų
+        hdr = ttk.Frame(self.card)
+        hdr.pack(fill="x")
+        self.lbl_kodas = ttk.Label(hdr, font=("Segoe UI", 15, "bold"))
+        self.lbl_kodas.pack(side="left")
+        self.lbl_info = ttk.Label(hdr, foreground="#6b7280")
+        self.lbl_info.pack(side="left", padx=(10, 0), pady=(5, 0))
+        b = _btn(hdr, "🗑", self._delete_order, "danger-link", width=3)
+        b.pack(side="right")
+        Tooltip(b, "Šalinti užsakymą iš sąrašo (laiškas pašte liks)")
+
+        # AI įspėjimas — ryški raudona juosta, rodoma tik kai yra
+        self.warn_lbl = tk.Label(self.card, justify="left", anchor="w", padx=10, pady=6,
+                                 font=("Segoe UI", 10, "bold"), wraplength=520, **_tkkw())
+        self.warn_lbl.configure(background="#fde2e2", foreground="#9b1c1c")
+
+        # Veiksmai su laišku + statusas
+        acts = ttk.Frame(self.card)
+        acts.pack(fill="x", pady=(8, 6))
+        self._acts = acts
+        for text, cmd, tip in [
+                ("✉ Laiškas", self._open_email, "Atidaryti pradinį laišką"),
+                ("📎 Priedai", self._open_attachments, "Atsisiųsti ir atidaryti priedus"),
+                ("📨 Rašyti tiekėjui", self._write_supplier,
+                 "Paruošti užklausos laišką tiekėjui su šio užsakymo prekėmis"),
+                ("📮 Užklausos", self._inquiries_window, "Kam išsiųsta užklausa ir kas atsakė")]:
+            b = _btn(acts, text, cmd, "secondary-outline")
+            b.pack(side="left", padx=(0, 4))
+            Tooltip(b, tip)
+        stat = ttk.Frame(self.card)
+        stat.pack(fill="x", pady=(0, 6))
+        ttk.Label(stat, text="Statusas").pack(side="left")
+        self.status_combo = ttk.Combobox(stat, state="disabled", width=12)
+        self.status_combo.pack(side="left", padx=(6, 14))
         self.status_combo.bind("<<ComboboxSelected>>", self._on_status_change)
-        ttk.Label(btns, text="Sąskaita:").pack(side="left", padx=(10, 2))
-        self.invoice_combo = ttk.Combobox(btns, state="disabled", width=9,
+        ttk.Label(stat, text="Sąskaita").pack(side="left")
+        self.invoice_combo = ttk.Combobox(stat, state="disabled", width=10,
                                           values=SASKAITOS_PASIRINKIMAI)
-        self.invoice_combo.pack(side="left")
+        self.invoice_combo.pack(side="left", padx=(6, 0))
         self.invoice_combo.bind("<<ComboboxSelected>>", self._on_invoice_change)
-        ttk.Button(btns, text="🗑 Šalinti", command=self._delete_order).pack(side="right")
+        ttk.Label(stat, text="(išsaugoma iškart)", foreground="#8a8a8a").pack(side="left",
+                                                                              padx=(8, 0))
 
-        self.detail = tk.Text(right, wrap="word", state="disabled", font=("Segoe UI", 10))
-        self.detail.pack(fill="both", expand=True)
+        # Vertikaliai: viršuje duomenys + prekės, apačioje pastabos (riba tempiama)
+        split = ttk.PanedWindow(self.card, orient="vertical")
+        split.pack(fill="both", expand=True)
+        top = ttk.Frame(split)
+        split.add(top, weight=4)
 
-        notes_bar = ttk.Frame(right)
-        notes_bar.pack(fill="x", pady=(6, 0))
-        ttk.Label(notes_bar, text="Mano pastabos (priminimai sau):").pack(side="left")
-        ttk.Label(notes_bar, text="išsisaugo pačios",
-                  foreground="#777").pack(side="right")
-        self.notes = tk.Text(right, wrap="word", height=5, font=("Segoe UI", 10),
-                             background="#fffbe6")
-        self.notes.pack(fill="x", pady=(2, 0))
+        form = ttk.Labelframe(top, text=" Kliento duomenys ", padding=(10, 6))
+        form.pack(fill="x")
+        form.columnconfigure(1, weight=1)
+        form.columnconfigure(3, weight=1)
+        self.card_vars = {}
+        for key, label, r, c, wide in self.KORTELES_LAUKAI:
+            ttk.Label(form, text=label).grid(row=r, column=c * 2, sticky="w",
+                                             padx=(0 if c == 0 else 12, 6), pady=2)
+            var = tk.StringVar()
+            ent = ttk.Entry(form, textvariable=var)
+            ent.grid(row=r, column=c * 2 + 1, columnspan=3 if wide else 1,
+                     sticky="we", pady=2)
+            var.trace_add("write", lambda *a: self._mark_dirty())
+            self.card_vars[key] = var
+            if key == "sutartis":
+                Tooltip(ent, "Užsakymo kodas nesikeičia, net jei pataisote sutartį.")
+            elif key == "pasiulymo_terminas":
+                Tooltip(ent, "Formatas: 2026-09-01 12:00 (arba tik data)")
+        self.lbl_tiekejai = ttk.Label(form, foreground="#6b7280", wraplength=520,
+                                      justify="left")
+        self.lbl_tiekejai.grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.lbl_tiekejai.grid_remove()
+
+        items_fr = ttk.Labelframe(top, text=" Prekės ", padding=(8, 6))
+        items_fr.pack(fill="both", expand=True, pady=(8, 0))
+        self.items_editor = ItemsEditor(items_fr, on_change=self._mark_dirty, height=6)
+        self.items_editor.pack(fill="both", expand=True)
+
+        savebar = ttk.Frame(top)
+        savebar.pack(side="bottom", fill="x", pady=(6, 4), before=items_fr)
+        self.btn_save = _btn(savebar, "💾  Išsaugoti pakeitimus", self._save_card, "success")
+        self.btn_save.pack(side="left")
+        Tooltip(self.btn_save, "Arba Ctrl+S")
+        self.btn_revert = _btn(savebar, "↶ Atšaukti", self._revert_card, "secondary-link")
+        self.btn_revert.pack(side="left", padx=(6, 0))
+        self.dirty_var = tk.StringVar()
+        ttk.Label(savebar, textvariable=self.dirty_var, foreground="#c2410c").pack(
+            side="left", padx=(10, 0))
+
+        # Apačioje skirtukai: mano pastabos | kas buvo laiške
+        nb = ttk.Notebook(split)
+        split.add(nb, weight=1)
+        notes_tab = ttk.Frame(nb, padding=(0, 6, 0, 0))
+        nb.add(notes_tab, text="  📝 Mano pastabos  ")
+        ttk.Label(notes_tab, text="Priminimai sau — išsisaugo patys, nieko spausti nereikia.",
+                  foreground="#8a8a8a").pack(anchor="w")
+        self.notes = tk.Text(notes_tab, wrap="word", height=4, font=("Segoe UI", 10),
+                             relief="flat", padx=8, pady=6, **_tkkw())
+        self.notes.configure(background="#fffbe6", foreground="#1f2937",
+                             insertbackground="#1f2937")
+        self.notes.pack(fill="both", expand=True, pady=(2, 0))
         self.notes.bind("<KeyRelease>", self._notes_changed)
         self.notes.bind("<FocusOut>", lambda e: self._save_notes())
 
-        status_bar = ttk.Frame(self.root, padding=(8, 3))
-        status_bar.pack(fill="x", side="bottom")
-        self.status_var = tk.StringVar(value="Paruošta.")
-        ttk.Label(status_bar, textvariable=self.status_var, foreground="#555").pack(side="left")
+        info_tab = ttk.Frame(nb, padding=(0, 6, 0, 0))
+        nb.add(info_tab, text="  ✉ Iš laiško  ")
+        self.info_text = tk.Text(info_tab, wrap="word", height=4, font=("Segoe UI", 10),
+                                 relief="flat", padx=8, pady=6, state="disabled", **_tkkw())
+        self.info_text.configure(background="#f8fafc", foreground="#1f2937")
+        self.info_text.pack(fill="both", expand=True)
+
+        self._set_clean()
+        self._show_card(False)
+
+    def _show_card(self, show: bool):
+        if show:
+            self.card_empty.pack_forget()
+            self.card.pack(fill="both", expand=True)
+        else:
+            self.card.pack_forget()
+            self.card_empty.pack(fill="both", expand=True)
+
+    # --- sąrašo pagalbininkai ---
+
+    def _on_tree_motion(self, e):
+        """Paaiškinimai: stulpelių antraštės ir 🔔 stulpelio ženkliukai."""
+        region = self.tree.identify_region(e.x, e.y)
+        col_id = self.tree.identify_column(e.x)
+        try:
+            col = self.tree["columns"][int(col_id[1:]) - 1]
+        except (ValueError, IndexError):
+            col = None
+        text, key = "", None
+        if region == "heading" and col in self.STULPELIU_PAAISKINIMAI:
+            key, text = ("h", col), self.STULPELIU_PAAISKINIMAI[col]
+        elif region == "cell" and col == "atn":
+            iid = self.tree.identify_row(e.y)
+            val = self.tree.set(iid, "atn") if iid else ""
+            dalys = []
+            if "⚠" in val:
+                dalys.append("⚠ AI įspėjimas — atidarykite ir perskaitykite")
+            if "🔔" in val:
+                dalys.append("🔔 grandinėje atėjo naujas laiškas")
+            if "❗" in val:
+                dalys.append("❗ atsakė tiekėjas")
+            key, text = ("c", iid), "\n".join(dalys)
+        elif region == "cell" and col == "prekes":
+            iid = self.tree.identify_row(e.y)
+            val = self.tree.set(iid, "prekes") if iid else ""
+            if len(val) > 40:
+                key, text = ("p", iid), val.replace("; ", "\n")
+        if key == self._tree_tip_key:
+            return
+        self._tree_tip_hide()
+        if text:
+            self._tree_tip_key = key
+            self._tree_tip.show(e.x_root + 14, e.y_root + 18, text)
+
+    def _tree_tip_hide(self):
+        self._tree_tip_key = None
+        self._tree_tip.hide()
+
+    def _on_tree_right_click(self, e):
+        iid = self.tree.identify_row(e.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label="✉  Atidaryti laišką", command=self._open_email)
+        m.add_command(label="📎  Priedai", command=self._open_attachments)
+        m.add_command(label="📨  Rašyti tiekėjui", command=self._write_supplier)
+        m.add_command(label="📮  Užklausos", command=self._inquiries_window)
+        m.add_separator()
+        m.add_command(label="🗑  Šalinti užsakymą…", command=self._delete_order)
+        m.tk_popup(e.x_root, e.y_root)
 
     def _poll_queue(self):
         try:
@@ -342,43 +955,75 @@ class App:
                 self._day_refresh()
         self.root.after(200, self._poll_queue)
 
-    def _set_period(self, days):
-        """Greitieji laikotarpio mygtukai: šiandien / N dienų / šis mėnuo / visi."""
-        today = datetime.date.today()
-        if days is None:
-            self.date_from.set("")
-            self.date_to.set("")
-        elif days == -1:
-            self.date_from.set(today.replace(day=1).isoformat())
-            self.date_to.set(today.isoformat())
-        elif days == 0:
-            self.date_from.set(today.isoformat())
-            self.date_to.set(today.isoformat())
-        else:
-            self.date_from.set((today - datetime.timedelta(days=days - 1)).isoformat())
-            self.date_to.set(today.isoformat())
+    # --- filtrai ---
+
+    def _refresh_later(self, ms: int = 300):
+        """Paieška / datos rašant: sąrašas atsinaujina, kai trumpam nustojama rašyti."""
+        if self._refresh_after:
+            self.root.after_cancel(self._refresh_after)
+        self._refresh_after = self.root.after(ms, self._refresh_orders)
+
+    def _on_filter_pick(self, _e=None):
+        i = self.filter_combo.current()
+        if 0 <= i < len(self.FILTRAI):
+            self.filter_var.set(self.FILTRAI[i][0])
         self._refresh_orders()
 
-    def _current_orders(self):
+    def _on_period_pick(self, _e=None):
+        txt = self.period_combo.get()
+        days = dict(self.LAIKOTARPIAI).get(txt)
+        if days == "x":   # „Pasirinktos datos" — žmogus įrašys / pasirinks pats
+            return
+        self._set_period(days)
+
+    def _on_date_typed(self, *_a):
+        if self._period_prog:
+            return
+        self.period_combo.set("Pasirinktos datos")
+        self._refresh_later(500)
+
+    def _set_period(self, days):
+        """Greitieji laikotarpiai: šiandien / N dienų / šis mėnuo / visi."""
+        today = datetime.date.today()
+        if days is None:
+            a, b = "", ""
+        elif days == -1:
+            a, b = today.replace(day=1).isoformat(), today.isoformat()
+        elif days == 0:
+            a, b = today.isoformat(), today.isoformat()
+        else:
+            a, b = (today - datetime.timedelta(days=days - 1)).isoformat(), today.isoformat()
+        self._period_prog = True
+        try:
+            self.date_from.set(a)
+            self.date_to.set(b)
+        finally:
+            self._period_prog = False
+        self._refresh_orders()
+
+    @staticmethod
+    def _clean_date(var):
+        v = (var.get() or "").strip()
+        if not v:
+            return None
+        v = v.replace(".", "-").replace("/", "-")
+        try:
+            datetime.date.fromisoformat(v)
+            return v
+        except ValueError:
+            return None
+
+    def _current_orders(self, status_override=None):
         """Užsakymai pagal dabar pasirinktus filtrus (statusas, datos, paieška)."""
-        sel_filter = self.filter_var.get() if hasattr(self, "filter_var") else "visi"
+        sel_filter = status_override or (
+            self.filter_var.get() if hasattr(self, "filter_var") else "visi")
         status = None if sel_filter == "visi" else sel_filter
-
-        def clean(var):
-            v = (var.get() or "").strip()
-            if not v:
-                return None
-            v = v.replace(".", "-").replace("/", "-")
-            try:
-                datetime.date.fromisoformat(v)
-                return v
-            except ValueError:
-                return None
-
-        return storage.list_orders(status, clean(self.date_from), clean(self.date_to),
+        return storage.list_orders(status, self._clean_date(self.date_from),
+                                   self._clean_date(self.date_to),
                                    (self.search_var.get() or "").strip() or None)
 
     def _refresh_orders(self):
+        self._refresh_after = None
         selected = self.tree.selection()
         sel_id = selected[0] if selected else None
         for item in self.tree.get_children():
@@ -389,9 +1034,7 @@ class App:
                 items = json.loads(o.get("prekes_json") or "[]")
             except Exception:
                 items = []
-            prekes = "; ".join(f"{it.get('preke')} ({it.get('kiekis')})" for it in items[:4])
-            if len(items) > 4:
-                prekes += f" … (+{len(items) - 4})"
+            prekes = prekes_mod.trumpas_sarasas(items, 4)
             n_atts = len([s for s in (o.get("priedai") or "").split(";") if s.strip()])
             status = o.get("statusas") or ""
             group = "p" if _is_priority_order(o) else "n"
@@ -416,8 +1059,26 @@ class App:
                 _saskaitos_zenklas(o)))
         if sel_id and self.tree.exists(sel_id):
             self.tree.selection_set(sel_id)
-        if hasattr(self, "status_var"):
-            df, dt = (self.date_from.get() or "").strip(), (self.date_to.get() or "").strip()
+
+        # „Rodyti" sąrašas su kiekiais — iškart matosi, kiek kur yra
+        values, cur = [], 0
+        for i, (code, text) in enumerate(self.FILTRAI):
+            n = len(orders) if code == self.filter_var.get() else len(
+                self._current_orders(status_override=code))
+            values.append(f"{text}  ({n})")
+            if code == self.filter_var.get():
+                cur = i
+        self.filter_combo.config(values=values)
+        self.filter_combo.current(cur)
+
+        df, dt = (self.date_from.get() or "").strip(), (self.date_to.get() or "").strip()
+        blogos = [d for d, var in ((df, self.date_from), (dt, self.date_to))
+                  if d and not self._clean_date(var)]
+        self.count_var.set(f"Rodoma: {len(orders)}")
+        if blogos:
+            self.status_var.set(f"Data neatpažinta: {', '.join(blogos)} "
+                                "(rašykite 2026-10-25 arba pasirinkite kalendoriuje)")
+        elif hasattr(self, "status_var"):
             period = f" ({df or '…'} – {dt or '…'})" if (df or dt) else ""
             self.status_var.set(f"Rodoma užsakymų: {len(orders)}{period}")
 
@@ -427,82 +1088,170 @@ class App:
             return None
         return storage.get_order(int(sel[0]))
 
+    # --- užsakymo kortelė ---
+
     def _on_select(self, _event=None):
+        sel = self.tree.selection()
+        new_id = int(sel[0]) if sel else None
+        if self._card_dirty and self._card_id is not None:
+            if new_id is None or new_id == self._card_id:
+                return   # sąrašas persikrovė — pataisymų nenumetame
+            kodas = self.lbl_kodas.cget("text")
+            ans = messagebox.askyesnocancel(
+                "Neišsaugoti pakeitimai",
+                f"Užsakyme {kodas} yra neišsaugotų pataisymų.\n\n"
+                "Išsaugoti juos prieš pereinant prie kito užsakymo?")
+            if ans is None or (ans and not self._save_card()):
+                if self.tree.exists(str(self._card_id)):
+                    self.tree.selection_set(str(self._card_id))
+                return
+            if ans is False:
+                self._set_clean()
         self._save_notes()  # ankstesnio užsakymo pastabos — prieš persijungiant
-        o = self._selected_order()
-        self.detail.config(state="normal")
-        self.detail.delete("1.0", "end")
-        self.notes.delete("1.0", "end")
-        if o:
+        self._load_card(new_id)
+
+    def _card_snap(self, o: dict):
+        return tuple(o.get(k) for k in storage.REDAGUOJAMI_LAUKAI) + (o.get("prekes_json"),)
+
+    def _load_card(self, order_id):
+        o = storage.get_order(order_id) if order_id is not None else None
+        self._card_id = o["id"] if o else None
+        self._notes_order_id = self._card_id
+        if not o:
+            self.status_combo.set("")
+            self.status_combo.config(state="disabled")
+            self.invoice_combo.set("")
+            self.invoice_combo.config(state="disabled")
+            self.notes.delete("1.0", "end")
+            self.notes.edit_modified(False)
+            self._set_clean()
+            self._show_card(False)
+            return
+        self._show_card(True)
+        self._card_loading = True
+        try:
             values = PRIORITY_STATUSES if _is_priority_order(o) else NORMAL_STATUSES
             self.status_combo.config(state="readonly", values=["—"] + values)
             self.status_combo.set(o.get("statusas") or "—")
             self.invoice_combo.config(state="readonly")
             self.invoice_combo.set(_SASK_I_TEKSTA.get(int(o.get("saskaita") or 0), "—"))
-        else:
-            self.status_combo.set("")
-            self.status_combo.config(state="disabled")
-            self.invoice_combo.set("")
-            self.invoice_combo.config(state="disabled")
-        if o:
+
+            self.lbl_kodas.config(text=o.get("kodas") or "—")
+            rankinis = (o.get("store_id") or "") == "manual"
+            info = [f"gauta {o.get('received_at') or '—'}"]
+            if rankinis:
+                info.append("įvesta ranka")
+            elif o.get("pasitikejimas") is not None:
+                info.append(f"AI tikrumas {round((o.get('pasitikejimas') or 0) * 100)}%")
+            self.lbl_info.config(text="  ·  ".join(info))
+
+            warn = (o.get("ispejimas") or "").strip()
+            if warn:
+                self.warn_lbl.config(text=f"⚠  {warn}")
+                self.warn_lbl.pack(fill="x", pady=(6, 0), before=self._acts)
+            else:
+                self.warn_lbl.pack_forget()
+
+            for key, var in self.card_vars.items():
+                var.set(o.get(key) or "")
+            tiek = (o.get("uzklausti_tiekejai") or "").strip()
+            self.lbl_tiekejai.config(text=f"Užklausti tiekėjai: {tiek}" if tiek else "")
+            if tiek:
+                self.lbl_tiekejai.grid()
+            else:
+                self.lbl_tiekejai.grid_remove()
+
             try:
                 items = json.loads(o.get("prekes_json") or "[]")
             except Exception:
                 items = []
-            warn = (o.get("ispejimas") or "").strip()
-            lines = ([f"⚠ DĖMESIO: {warn}", ""] if warn else []) + [
-                f"Kodas:  {o.get('kodas') or '—'}",
-                f"Klientas:  {o.get('klientas') or '—'}",
-                f"Telefonas:  {o.get('kliento_telefonas') or '—'}",
-                f"Adresas:  {o.get('kliento_adresas') or '—'}",
-                f"El. paštas:  {o.get('kliento_el_pastas') or '—'}",
-                f"Užsakymo data:  {o.get('received_at')}",
-                f"Pasiūlyti iki:  {o.get('pasiulymo_terminas') or '—'}",
-                f"Pristatymo data:  {o.get('pristatymo_data') or '—'}",
-                f"Priedai:  {o.get('priedai') or 'nėra'}",
-                f"Sutartis:  {o.get('sutartis') or '—'}",
-                f"Užklausti tiekėjai:  {o.get('uzklausti_tiekejai') or '—'}",
-                f"Statusas:  {o.get('statusas')}   "
-                f"(pasitikėjimas {round((o.get('pasitikejimas') or 0) * 100)}%)",
-                "",
-                "PREKĖS:",
-            ]
-            for i, it in enumerate(items, 1):
-                line = f"  {i}. {it.get('preke')} — {it.get('kiekis')}"
-                if it.get("pastabos"):
-                    line += f"   [{it['pastabos']}]"
-                lines.append(line)
-            if not items:
-                lines.append("  (neišskaidyta)")
-            if o.get("atnaujinimai"):
-                lines += ["", "🔔 ATNAUJINIMAI (grandinės papildymai):"]
-                lines += ["   " + ln for ln in o["atnaujinimai"].splitlines()]
-            if o.get("pastabos"):
-                lines += ["", f"Pastabos iš laiško: {o['pastabos']}"]
+            self.items_editor.set_items(items, editable=True)
+
+            lines = []
             if o.get("santrauka"):
-                lines += ["", f"Santrauka: {o['santrauka']}"]
-            lines += ["", f"Laiškas: „{o.get('subject')}“", f"Siuntėjas: {o.get('sender')}"]
-            self.detail.insert("1.0", "\n".join(lines))
-            if warn:
-                # AI įspėjimas — raudonai, kad nepraslystų pro akis
-                self.detail.tag_configure(
-                    "ispejimas", foreground="#b00000", background="#ffdddd",
-                    font=("Segoe UI", 10, "bold"))
-                self.detail.tag_add("ispejimas", "1.0", "1.end")
+                lines += [f"Santrauka: {o['santrauka']}", ""]
+            if o.get("pastabos"):
+                lines += [f"Pastabos iš laiško: {o['pastabos']}", ""]
+            if o.get("atnaujinimai"):
+                lines += ["🔔 Atnaujinimai (grandinės papildymai):"]
+                lines += ["   " + ln for ln in o["atnaujinimai"].splitlines()] + [""]
+            lines += [f"Laiškas: „{o.get('subject')}“", f"Siuntėjas: {o.get('sender')}",
+                      f"Priedai: {o.get('priedai') or 'nėra'}"]
+            self.info_text.config(state="normal")
+            self.info_text.delete("1.0", "end")
+            self.info_text.insert("1.0", "\n".join(lines))
+            self.info_text.config(state="disabled")
+
+            self.notes.delete("1.0", "end")
             self.notes.insert("1.0", o.get("mano_pastabos") or "")
-            if o.get("atnaujinta") or o.get("tiekejas_atsake"):
-                # peržiūrėjus — 🔔 ir ❗ nuimami (⚠ lieka visada)
-                if o.get("atnaujinta"):
-                    storage.set_order_seen(o["id"])
-                if o.get("tiekejas_atsake"):
-                    storage.clear_supplier_replied(o["id"])
-                try:
-                    self.tree.set(str(o["id"]), "atn", "⚠" if warn else "")
-                except tk.TclError:
-                    pass
-        self._notes_order_id = o["id"] if o else None
-        self.notes.edit_modified(False)
-        self.detail.config(state="disabled")
+            self.notes.edit_modified(False)
+            self._card_snapshot = self._card_snap(o)
+        finally:
+            self._card_loading = False
+        self._set_clean()
+
+        if o.get("atnaujinta") or o.get("tiekejas_atsake"):
+            # peržiūrėjus — 🔔 ir ❗ nuimami (⚠ lieka visada)
+            if o.get("atnaujinta"):
+                storage.set_order_seen(o["id"])
+            if o.get("tiekejas_atsake"):
+                storage.clear_supplier_replied(o["id"])
+            try:
+                self.tree.set(str(o["id"]), "atn", "⚠" if warn else "")
+            except tk.TclError:
+                pass
+
+    def _mark_dirty(self):
+        if self._card_loading or self._card_id is None:
+            return
+        if not self._card_dirty:
+            self._card_dirty = True
+            self.btn_save.config(state="normal")
+            self.btn_revert.config(state="normal")
+            self.dirty_var.set("●  Yra neišsaugotų pakeitimų")
+
+    def _set_clean(self):
+        self._card_dirty = False
+        self.btn_save.config(state="disabled")
+        self.btn_revert.config(state="disabled")
+        self.dirty_var.set("")
+
+    def _revert_card(self):
+        if self._card_id is not None:
+            self._set_clean()
+            self._load_card(self._card_id)
+            self.status_var.set("Pakeitimai atšaukti.")
+
+    def _save_card(self) -> bool:
+        """Išsaugo kortelės pataisymus. Grąžina False, jei neišsaugota."""
+        if self._card_id is None or not self._card_dirty:
+            return True
+        self.items_editor.commit_edit()
+        o = storage.get_order(self._card_id)
+        if o is None:
+            messagebox.showerror("Klaida", "Šis užsakymas jau pašalintas.")
+            self._set_clean()
+            self._load_card(None)
+            return False
+        if self._card_snap(o) != self._card_snapshot:
+            if not messagebox.askyesno(
+                    "Užsakymas atsinaujino",
+                    "Kol taisėte, šis užsakymas atsinaujino iš pašto (atėjo papildymas).\n\n"
+                    "Taip — išsaugoti jūsų pataisymus (papildymas bus perrašytas).\n"
+                    "Ne — nieko nesaugoti ir parodyti naujausią versiją.",
+                    icon="warning"):
+                self._set_clean()
+                self._load_card(self._card_id)
+                return False
+        fields = {k: v.get() for k, v in self.card_vars.items()}
+        storage.update_order_fields(self._card_id, fields, self.items_editor.get_items())
+        kodas = o.get("kodas")
+        self._set_clean()
+        self._refresh_orders()
+        self._load_card(self._card_id)
+        self._publish_share()
+        self.status_var.set(f"✔ {kodas}: pakeitimai išsaugoti.")
+        return True
 
     # ---------------- Veiksmai ----------------
 
@@ -646,6 +1395,12 @@ class App:
 
     def _on_close(self):
         """Uždarant programą — neišsaugotos pastabos ir darbų eiga įrašomos."""
+        if self._card_dirty:
+            ans = messagebox.askyesnocancel(
+                "Neišsaugoti pakeitimai",
+                "Užsakymo kortelėje yra neišsaugotų pataisymų.\n\nIšsaugoti prieš uždarant?")
+            if ans is None or (ans and not self._save_card()):
+                return
         try:
             self._save_notes()
             if self._day_win is not None and self._day_win.winfo_exists():
@@ -656,46 +1411,65 @@ class App:
 
     def _new_order_dialog(self):
         """Rankinis užsakymo sukūrimas: kodas generuojasi pats iš vardo ir datos,
-        visi kiti laukai — laisvai pildomi."""
+        prekės — ta pati lentelė kaip kortelėje."""
         win = tk.Toplevel(self.root)
         win.title("Naujas užsakymas (rankinis)")
         win.grab_set()
-        win.resizable(False, False)
+        win.minsize(860, 0)
         frm = ttk.Frame(win, padding=14)
         frm.pack(fill="both", expand=True)
-
-        v = {}
-        laukai = [
-            ("klientas", "Klientas (vardas pavardė) *"),
-            ("uzsakymo_data", "Užsakymo data (YYYY-MM-DD)"),
-            ("sutartis", "Sutartis (prioritetinė sutartis gaus „!“)"),
-            ("pasiulymo_terminas", "Pasiūlyti iki (pvz., 2026-09-01 12:00)"),
-            ("pristatymo_data", "Pristatymas"),
-            ("kliento_el_pastas", "El. paštas"),
-            ("kliento_telefonas", "Telefonas"),
-            ("kliento_adresas", "Adresas"),
-        ]
-        for i, (kodas_l, tekstas) in enumerate(laukai):
-            ttk.Label(frm, text=tekstas).grid(row=i, column=0, sticky="w", pady=2)
-            v[kodas_l] = tk.StringVar()
-            ttk.Entry(frm, textvariable=v[kodas_l], width=42).grid(
-                row=i, column=1, sticky="w", pady=2, padx=(8, 0))
-        v["uzsakymo_data"].set(datetime.date.today().isoformat())
-
-        ttk.Label(frm, text="Prekės (po vieną eilutėje: pavadinimas ; kiekis ; pastaba)"
-                  ).grid(row=len(laukai), column=0, columnspan=2, sticky="w", pady=(8, 2))
-        prekes_txt = tk.Text(frm, width=64, height=6, font=("Segoe UI", 9))
-        prekes_txt.grid(row=len(laukai) + 1, column=0, columnspan=2, sticky="we")
-
-        ttk.Label(frm, text="Mano pastabos").grid(
-            row=len(laukai) + 2, column=0, columnspan=2, sticky="w", pady=(8, 2))
-        past_txt = tk.Text(frm, width=64, height=3, font=("Segoe UI", 9))
-        past_txt.grid(row=len(laukai) + 3, column=0, columnspan=2, sticky="we")
+        # mygtukai — apačioje visada matomi, net jei langas mažas
+        mygt = ttk.Frame(frm)
+        mygt.pack(side="bottom", fill="x", pady=(12, 0))
 
         kodo_var = tk.StringVar(value="Kodas: —")
-        ttk.Label(frm, textvariable=kodo_var, font=("Segoe UI", 10, "bold"),
-                  foreground="#1f3a5f").grid(row=len(laukai) + 4, column=0,
-                                             sticky="w", pady=(10, 0))
+        ttk.Label(frm, textvariable=kodo_var, font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(frm, text="Kodas susidaro pats iš kliento vardo ir datos.",
+                  foreground="#6b7280").pack(anchor="w", pady=(0, 8))
+
+        form = ttk.Labelframe(frm, text=" Kliento duomenys ", padding=(10, 6))
+        form.pack(fill="x")
+        form.columnconfigure(1, weight=1)
+        form.columnconfigure(3, weight=1)
+        v = {}
+        laukai = [  # (raktas, pavadinimas, eilutė, stulpelis, per visą plotį)
+            ("klientas", "Klientas *", 0, 0, False), ("kliento_imone", "Įmonė", 0, 1, False),
+            ("kliento_telefonas", "Telefonas", 1, 0, False),
+            ("kliento_el_pastas", "El. paštas", 1, 1, False),
+            ("kliento_adresas", "Adresas", 2, 0, True),
+            ("uzsakymo_data", "Užsakymo data", 3, 0, False),
+            ("sutartis", "Sutartis", 3, 1, False),
+            ("pasiulymo_terminas", "Pasiūlyti iki", 4, 0, False),
+            ("pristatymo_data", "Pristatymas", 4, 1, False),
+        ]
+        first = None
+        for key, label, r, c, wide in laukai:
+            ttk.Label(form, text=label).grid(row=r, column=c * 2, sticky="w",
+                                             padx=(0 if c == 0 else 12, 6), pady=2)
+            v[key] = tk.StringVar()
+            if key == "uzsakymo_data":
+                ent = _date_field(form, v[key])
+            else:
+                ent = ttk.Entry(form, textvariable=v[key])
+            ent.grid(row=r, column=c * 2 + 1, columnspan=3 if wide else 1, sticky="we", pady=2)
+            if key == "sutartis":
+                Tooltip(ent, "Prioritetinės sutarties užsakymo kodas gaus „!“")
+            elif key == "pasiulymo_terminas":
+                Tooltip(ent, "Formatas: 2026-09-01 12:00 (arba tik data)")
+            first = first or ent
+        v["uzsakymo_data"].set(datetime.date.today().isoformat())
+
+        items_fr = ttk.Labelframe(frm, text=" Prekės ", padding=(8, 6))
+        items_fr.pack(fill="both", expand=True, pady=(8, 0))
+        editor = ItemsEditor(items_fr, height=5)
+        editor.pack(fill="both", expand=True)
+        editor.set_items([], editable=True)
+
+        ttk.Label(frm, text="Mano pastabos").pack(anchor="w", pady=(8, 2))
+        past_txt = tk.Text(frm, height=3, font=("Segoe UI", 10), relief="flat",
+                           padx=8, pady=6, **_tkkw())
+        past_txt.configure(background="#fffbe6", foreground="#1f2937")
+        past_txt.pack(fill="x")
 
         def perziureti_koda(*_a):
             try:
@@ -716,16 +1490,8 @@ class App:
                 messagebox.showwarning("Trūksta", "Įrašykite kliento vardą — iš jo "
                                        "kuriamas kodas.", parent=win)
                 return
-            prekes = []
-            for eil in prekes_txt.get("1.0", "end-1c").splitlines():
-                if not eil.strip():
-                    continue
-                dalys = [d.strip() for d in eil.split(";")]
-                prekes.append({"preke": dalys[0],
-                               "kiekis": dalys[1] if len(dalys) > 1 else "",
-                               "pastabos": dalys[2] if len(dalys) > 2 else None})
             data = {k: var.get() for k, var in v.items()}
-            data["prekes"] = prekes
+            data["prekes"] = editor.get_items()
             data["mano_pastabos"] = past_txt.get("1.0", "end-1c").strip()
             kodas = storage.add_manual_order(data)
             win.destroy()
@@ -733,10 +1499,10 @@ class App:
             self._publish_share()
             self.status_var.set(f"✔ Sukurtas rankinis užsakymas {kodas}.")
 
-        mygt = ttk.Frame(frm)
-        mygt.grid(row=len(laukai) + 4, column=1, sticky="e", pady=(10, 0))
-        ttk.Button(mygt, text="💾 Sukurti", command=issaugoti).pack(side="left", padx=4)
-        ttk.Button(mygt, text="Atšaukti", command=win.destroy).pack(side="left")
+        _btn(mygt, "Atšaukti", win.destroy, "secondary-link").pack(side="right")
+        _btn(mygt, "💾  Sukurti užsakymą", issaugoti, "success").pack(side="right", padx=6)
+        if first is not None:
+            first.focus_set()
 
     def _write_supplier(self):
         """Sukuria Outlook JUODRAŠTĮ tiekėjui: tema „Užklausa <kodas>", tekste —
@@ -750,8 +1516,12 @@ class App:
             items = json.loads(o.get("prekes_json") or "[]")
         except Exception:
             items = []
-        eilutes = [f"{i}. {p.get('preke')} — {p.get('kiekis') or '?'}"
-                   for i, p in enumerate(items, 1)]
+        eilutes = []
+        for i, p in enumerate(items, 1):
+            eil = f"{i}. {prekes_mod.pilnas_pavadinimas(p)} — {prekes_mod.kiekis_tekstu(p)}"
+            if p.get("nuoroda"):
+                eil += f"\n   {p['nuoroda']}"
+            eilutes.append(eil)
         subject = f"Užklausa {o.get('kodas')}"
         body = ("Sveiki,\n\n"
                 "reikėtų pasiūlymo:\n\n"
@@ -956,6 +1726,9 @@ class App:
             if self._notes_order_id == o["id"]:
                 self._notes_order_id = None  # kad autosave nerašytų į ištrintą
                 self.notes.edit_modified(False)
+            if self._card_id == o["id"]:
+                self._set_clean()
+                self._load_card(None)
             storage.delete_order(o["id"])
             self._refresh_orders()
             self._publish_share()
@@ -1961,7 +2734,8 @@ class App:
             self.cfg["graph_tenant_id"] = gtid_var.get().strip()
             self.cfg["graph_login_hint"] = ghint_var.get().strip()
             self.cfg.save()
-            self.lbl_interval.config(text=f"(kas {self.cfg['check_interval_min']} min.)")
+            self.lbl_interval.config(
+                text=f"Automatiškai kas {self.cfg['check_interval_min']} min.")
             win.destroy()
 
         ttk.Button(frm, text="Išsaugoti", command=save).grid(row=15, column=1, sticky="e", pady=(12, 0))
@@ -2233,14 +3007,35 @@ class App:
 
 
 def main():
-    root = tk.Tk()
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+    root = tk.Tk()
+    _taikyti_tema(root)
     App(root)
     root.mainloop()
+
+
+def _taikyti_tema(root):
+    """Šviesi moderni tema; be ttkbootstrap — Windows standartinė."""
+    global TB
+    style = None
+    if TB:
+        try:
+            style = tb.Style(theme=TEMA)
+        except Exception:
+            TB = False
+    if style is None:
+        style = ttk.Style(root)
+        try:
+            style.theme_use("vista")
+        except tk.TclError:
+            pass
+    style.configure("Treeview", rowheight=28, font=("Segoe UI", 10))
+    style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+    style.configure(".", font=("Segoe UI", 10))
 
 
 if __name__ == "__main__":
